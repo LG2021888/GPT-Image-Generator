@@ -137,4 +137,5 @@ dist_cn2\GPT Image Generator CN2\GPT Image Generator CN2.exe
 ## 备注
 
 本工具面向 OpenAI-compatible Images API。不同中转或服务商的参数兼容度可能不同，如果某些参数不支持，日志区会显示 HTTP 状态码和服务端返回内容。
+
 免责声明：本工具仅用于个人学习、接口测试与合法授权场景，使用者应自行确保 API 来源、输入内容和生成结果的合规性，因使用本工具产生的任何风险与责任由使用者自行承担。
