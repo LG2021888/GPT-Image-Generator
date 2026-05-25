@@ -1,0 +1,5 @@
+**/output
+config.ini
+.npm-cache
+.pip-cache
+.pydeps
