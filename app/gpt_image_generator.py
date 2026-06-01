@@ -480,6 +480,8 @@ class GPTImageApp(tk.Tk):
         self.completed_count = 0
         self.total_elapsed = 0.0
         self.total_requests = 1
+        self.batch_concurrency = 1
+        self.batch_timeout = 80
 
         self._init_vars()
         self._build_ui()
@@ -511,7 +513,7 @@ class GPTImageApp(tk.Tk):
         self.prompt_mode_var = tk.StringVar(value="repeat")
         default_output = str((Path.cwd() / "output").resolve())
         self.output_dir_var = tk.StringVar(value=default_output)
-        self.stats_var = tk.StringVar(value="成功:0 失败:0 进行中:0 成功率:0% 平均:0.0s 最快:-- 最慢:-- ETA:--")
+        self.stats_var = tk.StringVar(value="成功:0 失败:0 进行中:0 成功率:0% 平均:0.0s 最快:-- 最慢:-- 预计剩余:--")
         self.elapsed_var = tk.StringVar(value="耗时:0.0s")
 
     def _build_ui(self) -> None:
@@ -702,7 +704,7 @@ class GPTImageApp(tk.Tk):
         self.progress_canvas.grid(row=0, column=2, sticky="ew", padx=(0, 12))
         self.progress_canvas.bind("<Configure>", lambda _event: self._draw_progress())
         ttk.Label(frame, textvariable=self.elapsed_var).grid(row=0, column=3, sticky="e")
-        ttk.Label(frame, textvariable=self.stats_var, anchor="e").grid(row=1, column=0, columnspan=4, sticky="ew", pady=(3, 0))
+        ttk.Label(frame, textvariable=self.stats_var, anchor="w").grid(row=1, column=2, columnspan=2, sticky="ew", pady=(3, 0))
 
     def _build_status_frame(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.LabelFrame(parent, text="请求状态", padding=6)
@@ -1406,6 +1408,8 @@ class GPTImageApp(tk.Tk):
         self.slowest_elapsed = None
         self.total_requests = len(prompts)
         concurrency = min(safe_int(self.concurrency_var.get(), 1, 1, 100), self.total_requests)
+        self.batch_concurrency = max(1, concurrency)
+        self.batch_timeout = max(1, settings.timeout)
         expected_images = self.total_requests * max(1, settings.image_count)
         self._init_request_statuses(self.total_requests, settings.retry_count)
         self.batch_started_at = time.time()
@@ -1886,14 +1890,21 @@ class GPTImageApp(tk.Tk):
         success_rate = (self.success_count * 100 / self.completed_count) if self.completed_count else 0.0
         fastest = f"{self.fastest_elapsed:.1f}s" if self.fastest_elapsed is not None else "--"
         slowest = f"{self.slowest_elapsed:.1f}s" if self.slowest_elapsed is not None else "--"
-        if self.completed_count and self.running:
-            remaining = max(self.total_requests - self.completed_count, 0)
-            eta = f"{remaining * avg:.1f}s"
+        remaining = max(self.total_requests - self.completed_count, 0)
+        if remaining == 0 and self.total_requests:
+            eta = "0.0s"
+        elif self.running:
+            unit_seconds = avg if self.completed_count else float(self.batch_timeout)
+            waves = max(1, math.ceil(remaining / max(1, self.batch_concurrency)))
+            eta_seconds = waves * unit_seconds
+            if not self.completed_count and self.batch_started_at is not None:
+                eta_seconds = max(0.0, eta_seconds - (time.time() - self.batch_started_at))
+            eta = f"{eta_seconds:.1f}s"
         else:
             eta = "--"
         self.stats_var.set(
             f"成功:{self.success_count} 失败:{self.fail_count} 进行中:{self.in_flight_count} "
-            f"成功率:{success_rate:.0f}% 平均:{avg:.1f}s 最快:{fastest} 最慢:{slowest} ETA:{eta}"
+            f"成功率:{success_rate:.0f}% 平均:{avg:.1f}s 最快:{fastest} 最慢:{slowest} 预计剩余:{eta}"
         )
 
 
