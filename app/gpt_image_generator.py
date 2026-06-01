@@ -21,6 +21,7 @@ import math
 import mimetypes
 import os
 import queue
+import socket
 import subprocess
 import threading
 import time
@@ -29,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,10 +49,12 @@ MAX_INPUT_BYTES = 30 * 1024 * 1024
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-image-2"
 DEFAULT_GROK_BASE_URL = "https://api.x.ai/v1"
-DEFAULT_GROK_MODEL = "grok-imagine-image-quality"
+DEFAULT_GROK_MODEL = "grok-imagine-image-lite"
 CONFIG_FILE = "config.ini"
+PROMPT_HISTORY_FILE = "prompt_history.json"
 DEFAULT_PROFILE = "默认"
 PROMPT_HISTORY_LIMIT = 30
+DEFAULT_PROMPT_TEXT = "输入你的图片生成提示词；图生图模式下会结合所选图片进行编辑或参考。"
 
 PRESET_SIZES = [
     "自动（模型自动选择）",
@@ -92,6 +95,9 @@ class RequestSettings:
     compression: int
     model: str
     output_dir: str
+    timeout: int
+    retry_count: int
+    retry_delay: int
 
 
 class ImageApiError(RuntimeError):
@@ -278,9 +284,12 @@ class ImageApiClient:
             body = raw.decode("utf-8", errors="replace") if raw else ""
             raise ImageApiError(f"HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
-            raise ImageApiError(f"网络错误: {exc.reason}") from exc
-        except TimeoutError as exc:
-            raise ImageApiError("网络超时") from exc
+            reason = exc.reason
+            if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason).lower():
+                raise ImageApiError(f"网络超时（超过 {self.timeout}s）") from exc
+            raise ImageApiError(f"网络错误: {reason}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise ImageApiError(f"网络超时（超过 {self.timeout}s）") from exc
 
 
 def build_multipart_body(fields: Dict[str, Any], image_paths: List[str], boundary: str) -> Tuple[bytes, str]:
@@ -435,19 +444,33 @@ class GPTImageApp(tk.Tk):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("980x780")
-        self.minsize(920, 680)
+        self.minsize(920, 760)
 
         self.config_path = app_base_dir() / CONFIG_FILE
+        self.prompt_history_path = app_base_dir() / PROMPT_HISTORY_FILE
         self.log_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self.profiles: Dict[str, Dict[str, str]] = {}
         self.prompt_history: List[str] = []
-        self.prompt_history_popup: Optional[tk.Toplevel] = None
+        self.prompt_history_panel: Optional[tk.Frame] = None
+        self.prompt_history_rows_frame: Optional[tk.Frame] = None
+        self.prompt_history_detail_text: Optional[tk.Text] = None
+        self.prompt_history_count_label: Optional[tk.Label] = None
+        self.prompt_history_path_label: Optional[tk.Label] = None
         self.selected_images: List[str] = []
         self.running = False
         self.stop_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
         self.progress_animating = False
         self.fake_progress = 0
+        self.progress_percent = 0
+        self.progress_canvas: Optional[tk.Canvas] = None
+        self.progress_text = "0/0 0%"
+        self.status_tree: Optional[ttk.Treeview] = None
+        self.request_statuses: Dict[int, Dict[str, Any]] = {}
+        self.in_flight_count = 0
+        self.fastest_elapsed: Optional[float] = None
+        self.slowest_elapsed: Optional[float] = None
+        self.batch_stopping = False
         self.batch_started_at: Optional[float] = None
         self.elapsed_timer_running = False
         self.batch_prompt_for_history = ""
@@ -482,9 +505,13 @@ class GPTImageApp(tk.Tk):
         self.model_var = tk.StringVar(value=DEFAULT_MODEL)
         self.total_requests_var = tk.IntVar(value=1)
         self.concurrency_var = tk.IntVar(value=1)
+        self.retry_count_var = tk.IntVar(value=0)
+        self.retry_delay_var = tk.IntVar(value=3)
+        self.timeout_var = tk.IntVar(value=80)
+        self.prompt_mode_var = tk.StringVar(value="repeat")
         default_output = str((Path.cwd() / "output").resolve())
         self.output_dir_var = tk.StringVar(value=default_output)
-        self.stats_var = tk.StringVar(value="成功:0 失败:0 平均:0.0s")
+        self.stats_var = tk.StringVar(value="成功:0 失败:0 进行中:0 成功率:0% 平均:0.0s 最快:-- 最慢:-- ETA:--")
         self.elapsed_var = tk.StringVar(value="耗时:0.0s")
 
     def _build_ui(self) -> None:
@@ -502,6 +529,7 @@ class GPTImageApp(tk.Tk):
         self._build_stress_frame(root, 5)
         self._build_control_frame(root, 6)
         self._build_log_frame(root, 7)
+        self._build_status_frame(root, 8)
 
     def _build_api_frame(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.LabelFrame(parent, text="API 配置", padding=6)
@@ -550,11 +578,71 @@ class GPTImageApp(tk.Tk):
         frame = ttk.LabelFrame(parent, text="提示词", padding=6)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         frame.columnconfigure(0, weight=1)
+        mode_row = ttk.Frame(frame)
+        mode_row.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(mode_row, text="提示词模式:").pack(side="left")
+        ttk.Radiobutton(mode_row, text="单提示词重复", variable=self.prompt_mode_var, value="repeat").pack(side="left", padx=(8, 12))
+        ttk.Radiobutton(mode_row, text="每行一个提示词", variable=self.prompt_mode_var, value="lines").pack(side="left")
         self.prompt_text = tk.Text(frame, height=3, wrap="word", undo=True)
-        self.prompt_text.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.prompt_text.grid(row=1, column=0, sticky="ew", padx=(0, 8))
         self.prompt_history_button = ttk.Button(frame, text="历史", width=8, command=self._show_prompt_history)
-        self.prompt_history_button.grid(row=0, column=1, sticky="ns")
-        self.prompt_text.insert("1.0", "输入你的图片生成提示词；图生图模式下会结合所选图片进行编辑或参考。")
+        self.prompt_history_button.grid(row=1, column=1, sticky="ns")
+        self.prompt_text.insert("1.0", DEFAULT_PROMPT_TEXT)
+        self._build_prompt_history_panel(frame)
+
+    def _build_prompt_history_panel(self, parent: ttk.Frame) -> None:
+        self.prompt_history_panel = tk.Frame(parent, bd=1, relief="solid", padx=6, pady=6)
+        self.prompt_history_panel.columnconfigure(0, weight=1)
+
+        header = tk.Frame(self.prompt_history_panel)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        header.columnconfigure(0, weight=1)
+        self.prompt_history_count_label = tk.Label(header, text="历史记录列表（0 条）")
+        self.prompt_history_count_label.grid(row=0, column=0, sticky="w")
+        tk.Button(header, text="刷新", width=6, command=self._reload_prompt_history_panel).grid(row=0, column=1, padx=(8, 0))
+        tk.Button(header, text="关闭", width=6, command=self._hide_prompt_history_panel).grid(row=0, column=2, padx=(8, 0))
+        self.prompt_history_path_label = tk.Label(header, text="", anchor="w", justify="left", fg="#555555")
+        self.prompt_history_path_label.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(3, 0))
+
+        rows_container = tk.Frame(self.prompt_history_panel, bd=1, relief="groove")
+        rows_container.grid(row=1, column=0, sticky="nsew")
+        rows_container.columnconfigure(0, weight=1)
+        rows_container.rowconfigure(0, weight=1)
+
+        self.prompt_history_canvas = tk.Canvas(rows_container, height=220, highlightthickness=0)
+        self.prompt_history_canvas.grid(row=0, column=0, sticky="nsew")
+        self.prompt_history_scrollbar = ttk.Scrollbar(rows_container, orient="vertical", command=self.prompt_history_canvas.yview)
+        self.prompt_history_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.prompt_history_canvas.configure(yscrollcommand=self.prompt_history_scrollbar.set)
+
+        self.prompt_history_rows_frame = tk.Frame(self.prompt_history_canvas)
+        self._prompt_history_rows_window = self.prompt_history_canvas.create_window(
+            (0, 0), window=self.prompt_history_rows_frame, anchor="nw"
+        )
+
+        def _on_rows_configure(_event):
+            self.prompt_history_canvas.configure(scrollregion=self.prompt_history_canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            self.prompt_history_canvas.itemconfigure(self._prompt_history_rows_window, width=event.width)
+
+        self.prompt_history_rows_frame.bind("<Configure>", _on_rows_configure)
+        self.prompt_history_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            self.prompt_history_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        def _bind_wheel(_e):
+            self.prompt_history_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_wheel(_e):
+            self.prompt_history_canvas.unbind_all("<MouseWheel>")
+
+        self.prompt_history_canvas.bind("<Enter>", _bind_wheel)
+        self.prompt_history_canvas.bind("<Leave>", _unbind_wheel)
+
+        self.prompt_history_detail_text = tk.Text(self.prompt_history_panel, height=3, wrap="word")
+        self.prompt_history_detail_text.grid(row=2, column=0, sticky="ew", pady=(6, 0))
 
     def _build_params_frame(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.LabelFrame(parent, text="参数", padding=6)
@@ -595,6 +683,12 @@ class GPTImageApp(tk.Tk):
         ttk.Entry(frame, textvariable=self.output_dir_var).grid(row=0, column=5, sticky="ew", padx=(4, 6), pady=3)
         ttk.Button(frame, text="...", width=4, command=self._select_output_dir).grid(row=0, column=6, pady=3)
         ttk.Button(frame, text="打开输出目录", command=self._open_output_dir).grid(row=0, column=7, padx=(8, 0), pady=3)
+        ttk.Label(frame, text="失败重试:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Spinbox(frame, from_=0, to=5, textvariable=self.retry_count_var, width=8).grid(row=1, column=1, sticky="w", padx=(4, 16), pady=3)
+        ttk.Label(frame, text="重试间隔(s):").grid(row=1, column=2, sticky="w", pady=3)
+        ttk.Spinbox(frame, from_=0, to=60, textvariable=self.retry_delay_var, width=8).grid(row=1, column=3, sticky="w", padx=(4, 16), pady=3)
+        ttk.Label(frame, text="超时秒数:").grid(row=1, column=4, sticky="w", pady=3)
+        ttk.Spinbox(frame, from_=10, to=1800, textvariable=self.timeout_var, width=8).grid(row=1, column=5, sticky="w", padx=(4, 6), pady=3)
 
     def _build_control_frame(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.Frame(parent)
@@ -604,17 +698,34 @@ class GPTImageApp(tk.Tk):
         self.start_button.grid(row=0, column=0, sticky="w")
         self.stop_button = ttk.Button(frame, text="停止", command=self._stop, state="disabled")
         self.stop_button.grid(row=0, column=1, sticky="w", padx=(12, 18))
-        self.progress = ttk.Progressbar(frame, mode="determinate", maximum=100, value=0)
-        self.progress.grid(row=0, column=2, sticky="ew", padx=(0, 12))
-        ttk.Label(frame, textvariable=self.elapsed_var).grid(row=0, column=3, sticky="e", padx=(0, 12))
-        ttk.Label(frame, textvariable=self.stats_var).grid(row=0, column=4, sticky="e")
+        self.progress_canvas = tk.Canvas(frame, height=18, highlightthickness=0, bd=0)
+        self.progress_canvas.grid(row=0, column=2, sticky="ew", padx=(0, 12))
+        self.progress_canvas.bind("<Configure>", lambda _event: self._draw_progress())
+        ttk.Label(frame, textvariable=self.elapsed_var).grid(row=0, column=3, sticky="e")
+        ttk.Label(frame, textvariable=self.stats_var, anchor="e").grid(row=1, column=0, columnspan=4, sticky="ew", pady=(3, 0))
+
+    def _build_status_frame(self, parent: ttk.Frame, row: int) -> None:
+        frame = ttk.LabelFrame(parent, text="请求状态", padding=6)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        frame.columnconfigure(0, weight=1)
+        columns = ("idx", "status", "elapsed", "retry", "result")
+        self.status_tree = ttk.Treeview(frame, columns=columns, show="headings", height=3)
+        headings = {"idx": "#", "status": "状态", "elapsed": "耗时", "retry": "重试", "result": "结果"}
+        widths = {"idx": 48, "status": 80, "elapsed": 70, "retry": 70, "result": 640}
+        for col in columns:
+            self.status_tree.heading(col, text=headings[col])
+            self.status_tree.column(col, width=widths[col], minwidth=40, anchor="w", stretch=(col == "result"))
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.status_tree.yview)
+        self.status_tree.configure(yscrollcommand=scroll.set)
+        self.status_tree.grid(row=0, column=0, sticky="ew")
+        scroll.grid(row=0, column=1, sticky="ns")
 
     def _build_log_frame(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.LabelFrame(parent, text="日志", padding=6)
         frame.grid(row=row, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        self.log_text = tk.Text(frame, height=10, wrap="word", state="disabled")
+        self.log_text = tk.Text(frame, height=7, wrap="word", state="disabled")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scroll.set)
         self.log_text.grid(row=0, column=0, sticky="nsew")
@@ -655,98 +766,123 @@ class GPTImageApp(tk.Tk):
         self._refresh_image_label()
 
     def _show_prompt_history(self) -> None:
-        if self.prompt_history_popup is not None and self.prompt_history_popup.winfo_exists():
-            self.prompt_history_popup.lift()
-            self.prompt_history_popup.focus_force()
+        if self.prompt_history_panel is None:
             return
-
-        popup = tk.Toplevel(self)
-        self.prompt_history_popup = popup
-        popup.title("提示词历史")
-        popup.transient(self)
-        popup.attributes("-topmost", True)
-
-        self.prompt_history_button.update_idletasks()
-        width = 520
-        height = 360
-        x = self.prompt_history_button.winfo_rootx() + self.prompt_history_button.winfo_width() - width
-        y = self.prompt_history_button.winfo_rooty() + self.prompt_history_button.winfo_height()
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        x = max(0, min(x, screen_width - width))
-        if y + height > screen_height:
-            y = max(0, self.prompt_history_button.winfo_rooty() - height)
-        popup.geometry(f"{width}x{height}+{x}+{y}")
-
-        frame = ttk.Frame(popup, padding=6)
-        frame.grid(row=0, column=0, sticky="nsew")
-        popup.columnconfigure(0, weight=1)
-        popup.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-
-        def close(_event: Optional[tk.Event] = None) -> str:
-            self._close_prompt_history_popup()
-            return "break"
-
-        def close_on_outside_click(event: tk.Event) -> Optional[str]:
-            if not point_in_widget(popup, event.x_root, event.y_root):
-                self._close_prompt_history_popup()
-                return "break"
-            return None
-
-        if not self.prompt_history:
-            ttk.Label(frame, text="暂无提示词历史").grid(row=0, column=0, sticky="nsew")
-            popup.bind("<ButtonPress-1>", close_on_outside_click, add="+")
-            popup.bind("<Escape>", close)
-            popup.protocol("WM_DELETE_WINDOW", self._close_prompt_history_popup)
-            popup.grab_set()
-            popup.focus_force()
+        if self.prompt_history_panel.winfo_ismapped():
+            self._hide_prompt_history_panel()
             return
+        self.prompt_history_panel.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self._reload_prompt_history_panel()
+        self.prompt_history_panel.update_idletasks()
+        if hasattr(self, "prompt_history_canvas") and self.prompt_history_canvas is not None:
+            self.prompt_history_canvas.yview_moveto(0.0)
 
-        listbox = tk.Listbox(frame, height=min(len(self.prompt_history), 12), activestyle="dotbox")
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=listbox.yview)
-        listbox.configure(yscrollcommand=scroll.set)
-        listbox.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
-
-        for prompt in self.prompt_history:
-            listbox.insert("end", self._prompt_history_preview(prompt))
-
-        def choose(_event: Optional[tk.Event] = None) -> str:
-            selection = listbox.curselection()
-            if not selection:
-                return "break"
-            self._apply_prompt_history(int(selection[0]))
-            return "break"
-
-        listbox.bind("<ButtonRelease-1>", choose)
-        listbox.bind("<Return>", choose)
-        listbox.bind("<Escape>", close)
-        popup.bind("<ButtonPress-1>", close_on_outside_click, add="+")
-        popup.bind("<Escape>", close)
-        popup.protocol("WM_DELETE_WINDOW", self._close_prompt_history_popup)
-        popup.grab_set()
-        popup.focus_force()
-        listbox.focus_set()
-
-    def _close_prompt_history_popup(self) -> None:
-        popup = self.prompt_history_popup
-        if popup is not None:
-            try:
-                if popup.winfo_exists():
-                    if popup.grab_current() == popup:
-                        popup.grab_release()
-                    popup.destroy()
-            except Exception:
-                pass
-        self.prompt_history_popup = None
+    def _hide_prompt_history_panel(self) -> None:
+        if self.prompt_history_panel is not None:
+            self.prompt_history_panel.grid_remove()
 
     def _prompt_history_preview(self, prompt: str) -> str:
         preview = " ".join(prompt.split())
-        if len(preview) > 96:
-            return preview[:93] + "..."
+        if len(preview) > 88:
+            return preview[:85] + "..."
         return preview
+
+    def _set_prompt_history_detail(self, text: str) -> None:
+        if self.prompt_history_detail_text is None:
+            return
+        self.prompt_history_detail_text.configure(state="normal")
+        self.prompt_history_detail_text.delete("1.0", "end")
+        self.prompt_history_detail_text.insert("1.0", text)
+        self.prompt_history_detail_text.configure(state="disabled")
+
+    def _show_full_prompt_on_hover(self, prompt: str) -> None:
+        self._set_prompt_history_detail(prompt)
+
+    def _bind_prompt_history_hover(self, widget: tk.Widget, prompt: str) -> None:
+        widget.bind("<Enter>", lambda _event, text=prompt: self._show_full_prompt_on_hover(text))
+
+    def _fill_prompt_history_panel(self, history: List[str]) -> None:
+        self.prompt_history = history
+        if self.prompt_history_count_label is not None:
+            self.prompt_history_count_label.configure(text=f"历史记录列表（{len(history)} 条）")
+        if self.prompt_history_path_label is not None:
+            self.prompt_history_path_label.configure(text=f"历史文件: {self.prompt_history_path}")
+        if self.prompt_history_rows_frame is None:
+            return
+
+        for child in self.prompt_history_rows_frame.winfo_children():
+            child.destroy()
+        self.prompt_history_rows_frame.configure(height=40)
+
+        if not history:
+            empty_label = tk.Label(
+                self.prompt_history_rows_frame,
+                text="暂无提示词历史",
+                anchor="w",
+                padx=6,
+                pady=8,
+            )
+            empty_label.pack(fill="x", expand=True)
+            self._set_prompt_history_detail("暂无提示词历史")
+            self.prompt_history_rows_frame.update_idletasks()
+            self._enqueue_log("提示词历史: 已渲染 0 个按钮（无历史）")
+            return
+
+        for idx, prompt in enumerate(history):
+            row = tk.Frame(self.prompt_history_rows_frame)
+            row.pack(fill="x", padx=4, pady=3)
+            row.columnconfigure(0, weight=1)
+            row.columnconfigure(1, weight=0)
+            preview = f"{idx + 1}. {self._prompt_history_preview(prompt)}"
+            prompt_button = tk.Button(
+                row,
+                text=preview,
+                anchor="w",
+                padx=8,
+                pady=4,
+                relief="raised",
+                command=lambda i=idx: self._use_prompt_history_index(i),
+            )
+            prompt_button.grid(row=0, column=0, sticky="ew")
+            delete_button = tk.Button(
+                row,
+                text="删除",
+                width=6,
+                pady=4,
+                relief="raised",
+                command=lambda i=idx: self._delete_prompt_history_index(i),
+            )
+            delete_button.grid(row=0, column=1, sticky="e", padx=(6, 0))
+            self._bind_prompt_history_hover(prompt_button, prompt)
+            self._bind_prompt_history_hover(delete_button, prompt)
+
+        self._set_prompt_history_detail("点击历史内容回填；点击“删除”移除该条历史。")
+        self.prompt_history_rows_frame.update_idletasks()
+        if self.prompt_history_panel is not None:
+            self.prompt_history_panel.update_idletasks()
+        self._enqueue_log(f"提示词历史: 已渲染 {len(history)} 个按钮")
+
+    def _reload_prompt_history_panel(self) -> None:
+        try:
+            items = self._read_prompt_history_items_for_window()
+            self._enqueue_log(f"提示词历史: 读取到 {len(items)} 条")
+            self._fill_prompt_history_panel(items)
+        except Exception as exc:
+            import traceback
+            self._enqueue_log(f"提示词历史: 渲染失败 {type(exc).__name__}: {exc}")
+            self._enqueue_log(traceback.format_exc())
+
+    def _delete_prompt_history_index(self, index: int) -> None:
+        if index < 0 or index >= len(self.prompt_history):
+            return
+        removed = self.prompt_history[index]
+        self.prompt_history = self.prompt_history[:index] + self.prompt_history[index + 1 :]
+        try:
+            self._write_prompt_history_to_disk(self.prompt_history)
+            self._fill_prompt_history_panel(self.prompt_history)
+            self._set_prompt_history_detail(f"已删除: {self._prompt_history_preview(removed)}")
+        except Exception as exc:
+            self._enqueue_log(f"删除提示词历史失败: {exc}")
 
     def _apply_prompt_history(self, index: int) -> None:
         if index < 0 or index >= len(self.prompt_history):
@@ -754,22 +890,171 @@ class GPTImageApp(tk.Tk):
         self.prompt_text.delete("1.0", "end")
         self.prompt_text.insert("1.0", self.prompt_history[index])
         self.prompt_text.focus_set()
-        self._close_prompt_history_popup()
+
+    def _use_prompt_history_value(self, prompt: str) -> None:
+        self.prompt_text.delete("1.0", "end")
+        self.prompt_text.insert("1.0", prompt)
+        self.prompt_text.focus_set()
+
+    def _use_prompt_history_index(self, index: int) -> str:
+        self._apply_prompt_history(index)
+        self._hide_prompt_history_panel()
+        return "break"
+
+    def _refresh_prompt_history_window(self) -> None:
+        if self.prompt_history_panel is not None and self.prompt_history_panel.winfo_ismapped():
+            self._reload_prompt_history_panel()
+
+    def _refresh_prompt_history_from_window(self) -> None:
+        self._refresh_prompt_history_window()
+
+    def _read_prompt_history_items_for_window(self) -> List[str]:
+        history, _raw_count, error = self._read_prompt_history_for_window()
+        self.prompt_history = history
+        if error:
+            self._enqueue_log(f"读取提示词历史失败: {error}")
+        return history
+
+    def _read_prompt_history_for_window(self) -> Tuple[List[str], int, str]:
+        if self.prompt_history_path.exists():
+            try:
+                raw = self.prompt_history_path.read_text(encoding="utf-8").strip()
+            except Exception as exc:
+                return [], 0, f"读取 {PROMPT_HISTORY_FILE} 失败: {exc}"
+            if not raw:
+                return [], 0, f"{PROMPT_HISTORY_FILE} 为空"
+            return self._parse_prompt_history_raw(raw)
+        # 兼容老 config.ini 中残留的 [prompt_history]
+        if not self.config_path.exists():
+            return [], 0, f"{PROMPT_HISTORY_FILE} 和 config.ini 都不存在"
+        cfg = configparser.ConfigParser(interpolation=None)
+        try:
+            cfg.read(self.config_path, encoding="utf-8")
+        except Exception as exc:
+            return [], 0, f"读取 config.ini 失败: {exc}"
+        if not cfg.has_section("prompt_history"):
+            return [], 0, f"{PROMPT_HISTORY_FILE} 不存在，config.ini 也没有 [prompt_history] 区段"
+        raw = cfg.get("prompt_history", "items", fallback="").strip()
+        if not raw:
+            return [], 0, "items 为空"
+        return self._parse_prompt_history_raw(raw)
+
+    def _parse_prompt_history_raw(self, raw: str) -> Tuple[List[str], int, str]:
+        try:
+            data = json.loads(raw)
+        except Exception as exc:
+            repaired = self._escape_json_string_newlines(raw)
+            try:
+                data = json.loads(repaired)
+            except Exception:
+                return [], 0, f"items JSON 解析失败: {exc}"
+        if not isinstance(data, list):
+            return [], 0, "items 不是 JSON 数组"
+
+        return self._normalize_prompt_history(data), len(data), ""
+
+    def _escape_json_string_newlines(self, raw: str) -> str:
+        result: List[str] = []
+        in_string = False
+        escaped = False
+        for ch in raw:
+            if escaped:
+                result.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                result.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                result.append(ch)
+                continue
+            if in_string and ch in {"\n", "\r"}:
+                result.append("\\n")
+                continue
+            result.append(ch)
+        return "".join(result)
+
+    def _read_prompt_history_raw_from_broken_config(self) -> str:
+        try:
+            lines = self.config_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return ""
+
+        in_history = False
+        parts: List[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                if in_history:
+                    break
+                in_history = stripped.lower() == "[prompt_history]"
+                continue
+            if not in_history:
+                continue
+            if not parts:
+                if stripped.startswith("items"):
+                    _key, _sep, value = line.partition("=")
+                    parts.append(value.strip())
+                continue
+            parts.append(line)
+        return "\n".join(parts).strip()
+
+    def _close_prompt_history_window(self) -> None:
+        self._hide_prompt_history_panel()
 
     def _record_prompt_history(self, prompt: str) -> None:
         prompt = prompt.strip()
-        if not prompt:
+        if not prompt or prompt == DEFAULT_PROMPT_TEXT:
             return
-        self.prompt_history = [item for item in self.prompt_history if item != prompt]
-        self.prompt_history.insert(0, prompt)
-        self.prompt_history = self.prompt_history[:PROMPT_HISTORY_LIMIT]
+        if self.prompt_history and self.prompt_history[0] == prompt:
+            return
+        self.prompt_history = self._normalize_prompt_history([prompt] + self.prompt_history)
         try:
-            self._write_config()
+            self._write_prompt_history_to_disk(self.prompt_history)
+            self._refresh_prompt_history_window()
         except Exception as exc:
             self._enqueue_log(f"保存提示词历史失败: {exc}")
 
+    def _record_batch_prompt_history_once(self, prompt: str = "") -> None:
+        prompt = (prompt or self.batch_prompt_for_history).strip()
+        if self.batch_history_recorded or not prompt or prompt == DEFAULT_PROMPT_TEXT:
+            return
+        self._record_prompt_history(prompt)
+        self.batch_prompt_for_history = prompt
+        self.batch_history_recorded = True
+
+    def _normalize_prompt_history(self, items: List[str]) -> List[str]:
+        history: List[str] = []
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            prompt = item.strip()
+            if not prompt or prompt == DEFAULT_PROMPT_TEXT:
+                continue
+            if prompt in history:
+                continue
+            history.append(prompt)
+            if len(history) >= PROMPT_HISTORY_LIMIT:
+                break
+        return history
+
+    def _sync_prompt_history_from_config(self) -> None:
+        if not self.config_path.exists():
+            return
+        cfg = configparser.ConfigParser(interpolation=None)
+        try:
+            cfg.read(self.config_path, encoding="utf-8")
+        except Exception as exc:
+            self._enqueue_log(f"同步提示词历史失败: {exc}")
+            return
+        loaded = self._load_prompt_history(cfg)
+        self.prompt_history = loaded
+        self._refresh_prompt_history_window()
+
     def _load_config(self) -> None:
-        cfg = configparser.ConfigParser()
+        cfg = configparser.ConfigParser(interpolation=None)
         loaded = False
         try:
             if self.config_path.exists():
@@ -826,38 +1111,40 @@ class GPTImageApp(tk.Tk):
             self._enqueue_log("未找到 config.ini，已使用默认配置")
 
     def _load_prompt_history(self, cfg: configparser.ConfigParser) -> List[str]:
-        if not cfg.has_section("prompt_history"):
-            return []
-        raw = cfg.get("prompt_history", "items", fallback="[]").strip()
-        if not raw:
-            return []
-        try:
-            data = json.loads(raw)
-        except Exception as exc:
-            self._enqueue_log(f"提示词历史格式无效，已忽略: {exc}")
-            return []
-        if not isinstance(data, list):
-            self._enqueue_log("提示词历史格式无效，已忽略: items 不是数组")
-            return []
+        # 1) 优先读独立 json 文件
+        if self.prompt_history_path.exists():
+            try:
+                raw = self.prompt_history_path.read_text(encoding="utf-8").strip()
+                if not raw:
+                    return []
+                history, _n, error = self._parse_prompt_history_raw(raw)
+                if error:
+                    self._enqueue_log(f"提示词历史格式无效，已忽略: {error}")
+                return history
+            except Exception as exc:
+                self._enqueue_log(f"读取 {PROMPT_HISTORY_FILE} 失败: {exc}")
+                return []
+        # 2) fallback：从 INI [prompt_history] 迁移
+        if cfg.has_section("prompt_history"):
+            raw = cfg.get("prompt_history", "items", fallback="[]").strip()
+            history, _n, error = self._parse_prompt_history_raw(raw) if raw else ([], 0, "")
+            if error:
+                self._enqueue_log(f"提示词历史格式无效，已忽略: {error}")
+            if history:
+                try:
+                    self._write_prompt_history_to_disk(history)
+                    self._enqueue_log(f"已从 config.ini 迁移 {len(history)} 条提示词历史到 {PROMPT_HISTORY_FILE}")
+                except Exception as exc:
+                    self._enqueue_log(f"迁移提示词历史失败: {exc}")
+            return history
+        return []
 
-        history: List[str] = []
-        ignored = 0
-        for item in data:
-            if not isinstance(item, str):
-                ignored += 1
-                continue
-            prompt = item.strip()
-            if not prompt:
-                ignored += 1
-                continue
-            if prompt in history:
-                continue
-            history.append(prompt)
-            if len(history) >= PROMPT_HISTORY_LIMIT:
-                break
-        if ignored:
-            self._enqueue_log(f"提示词历史中有 {ignored} 条无效记录，已忽略")
-        return history
+    def _write_prompt_history_to_disk(self, history: List[str]) -> None:
+        data = history[:PROMPT_HISTORY_LIMIT]
+        self.prompt_history_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def _save_config(self) -> None:
         name = self.profile_name_var.get().strip() or self.profile_var.get().strip() or DEFAULT_PROFILE
@@ -879,7 +1166,8 @@ class GPTImageApp(tk.Tk):
             messagebox.showerror("保存配置失败", str(exc))
 
     def _write_config(self) -> None:
-        cfg = configparser.ConfigParser()
+        cfg = configparser.ConfigParser(interpolation=None)
+        self.prompt_history = self._normalize_prompt_history(self.prompt_history)
         cfg["app"] = {
             "current_profile": self.profile_var.get().strip() or DEFAULT_PROFILE,
             "output_dir": self.output_dir_var.get().strip(),
@@ -899,9 +1187,6 @@ class GPTImageApp(tk.Tk):
                 "api_key": self.api_key_var.get().strip(),
                 "model": self.model_var.get().strip() or DEFAULT_MODEL,
             }
-        cfg["prompt_history"] = {
-            "items": json.dumps(self.prompt_history[:PROMPT_HISTORY_LIMIT], ensure_ascii=False),
-        }
         for name, profile in self.profiles.items():
             section = f"profile:{name}"
             cfg[section] = {
@@ -1037,13 +1322,16 @@ class GPTImageApp(tk.Tk):
         size = custom_size if custom_size else strip_auto_label(self.size_preset_var.get())
         mode = self.mode_var.get()
         platform = platform_label_to_api(self.platform_var.get())
+        prompt = self.prompt_text.get("1.0", "end").strip()
+        if prompt == DEFAULT_PROMPT_TEXT:
+            prompt = ""
         return RequestSettings(
             platform=platform,
             base_url=normalize_base_url(self.base_url_var.get()),
             api_key=self.api_key_var.get().strip(),
             mode=mode,
             image_paths=[] if mode == "generate" else list(self.selected_images),
-            prompt=self.prompt_text.get("1.0", "end").strip(),
+            prompt=prompt,
             size=size,
             image_count=safe_int(self.image_count_var.get(), 1, 1, 3),
             quality=quality_label_to_api(self.quality_var.get()),
@@ -1052,6 +1340,9 @@ class GPTImageApp(tk.Tk):
             compression=safe_int(self.compression_var.get(), 100, 0, 100),
             model=self.model_var.get().strip() or DEFAULT_MODEL,
             output_dir=self.output_dir_var.get().strip() or str((Path.cwd() / "output").resolve()),
+            timeout=safe_int(self.timeout_var.get(), 80, 10, 1800),
+            retry_count=safe_int(self.retry_count_var.get(), 0, 0, 5),
+            retry_delay=safe_int(self.retry_delay_var.get(), 3, 0, 60),
         )
 
     def _validate_settings(self, settings: RequestSettings) -> Optional[str]:
@@ -1090,26 +1381,40 @@ class GPTImageApp(tk.Tk):
         if err:
             messagebox.showerror("参数错误", err)
             return
+        prompts = self._build_batch_prompts(settings.prompt)
+        if not prompts:
+            messagebox.showerror("参数错误", "请填写提示词。")
+            return
+        if self.prompt_mode_var.get() == "lines":
+            self.total_requests_var.set(len(prompts))
         try:
             Path(settings.output_dir).mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             messagebox.showerror("输出目录错误", str(exc))
             return
         self.running = True
+        self.batch_stopping = False
         self.stop_event.clear()
-        self.batch_prompt_for_history = settings.prompt
+        self.batch_prompt_for_history = prompts[0] if prompts else settings.prompt
         self.batch_history_recorded = False
         self.success_count = 0
         self.fail_count = 0
         self.completed_count = 0
+        self.in_flight_count = 0
         self.total_elapsed = 0.0
-        self.total_requests = safe_int(self.total_requests_var.get(), 1, 1, 10000)
+        self.fastest_elapsed = None
+        self.slowest_elapsed = None
+        self.total_requests = len(prompts)
         concurrency = min(safe_int(self.concurrency_var.get(), 1, 1, 100), self.total_requests)
+        expected_images = self.total_requests * max(1, settings.image_count)
+        self._init_request_statuses(self.total_requests, settings.retry_count)
         self.batch_started_at = time.time()
         self.elapsed_timer_running = True
-        self.progress.configure(maximum=100, value=0)
+        self.progress_percent = 0
+        self.progress_text = f"0/{self.total_requests} 0%"
         self.fake_progress = 0
         self.progress_animating = True
+        self._draw_progress()
         self._update_stats()
         self._update_elapsed_timer()
         self.start_button.configure(state="disabled")
@@ -1117,9 +1422,11 @@ class GPTImageApp(tk.Tk):
         platform_name = platform_api_to_label(settings.platform)
         style_name = style_api_to_label(settings.style)
         self._enqueue_log(
-            f"开始 | Images API 测试 | 平台:{platform_name} 总数:{self.total_requests} 并发:{concurrency} "
-            f"单次张数:{settings.image_count} 尺寸:{size_label(settings.size)} 质量:{settings.quality} "
-            f"风格:{style_name} 格式:{settings.output_format} 模型:{settings.model}"
+            f"开始 | Images生成 | 平台:{platform_name} 总数:{self.total_requests} 并发:{concurrency} "
+            f"单次张数:{settings.image_count} 预计生成:{expected_images} 张 "
+            f"尺寸:{size_label(settings.size)} 质量:{settings.quality} "
+            f"风格:{style_name} 格式:{settings.output_format} 模型:{settings.model} "
+            f"重试:{settings.retry_count} 间隔:{settings.retry_delay}s 超时:{settings.timeout}s"
         )
         if should_resize_output(settings):
             self._enqueue_log(f"已启用本地尺寸校正：服务商返回非目标尺寸时会保存后调整为 {settings.size}")
@@ -1130,84 +1437,227 @@ class GPTImageApp(tk.Tk):
             )
         self._enqueue_log(f"接口: {settings.base_url}/images/{'edits' if settings.mode == 'edit' else 'generations'}")
         self._animate_progress()
-        self.worker_thread = threading.Thread(target=self._run_batch, args=(settings, self.total_requests, concurrency), daemon=True)
+        self.worker_thread = threading.Thread(target=self._run_batch, args=(settings, prompts, concurrency), daemon=True)
         self.worker_thread.start()
+
+    def _build_batch_prompts(self, prompt: str) -> List[str]:
+        if self.prompt_mode_var.get() == "lines":
+            raw_prompts = [line.strip() for line in prompt.splitlines() if line.strip()]
+        else:
+            total = safe_int(self.total_requests_var.get(), 1, 1, 10000)
+            raw_prompts = [prompt.strip()] * total
+        return [item.replace("{index}", str(idx)) for idx, item in enumerate(raw_prompts, start=1)]
 
     def _stop(self) -> None:
         if self.running:
+            self.batch_stopping = True
             self.stop_event.set()
-            self._enqueue_log("已请求停止：未开始的请求将不再提交，已发出的请求会等待返回。")
+            canceled = 0
+            for idx, info in self.request_statuses.items():
+                if info.get("status") == "等待中":
+                    self._update_request_status(idx, status="已取消", result="未提交")
+                    canceled += 1
+            self._update_stop_waiting_status()
+            self._enqueue_log(f"已请求停止：未开始请求已取消 {canceled} 个，已发出的请求会等待返回。")
             self.stop_button.configure(state="disabled")
+            self._update_stats()
+            self._set_real_progress()
 
     def _animate_progress(self) -> None:
         if not self.progress_animating or not self.running:
             return
-        if self.completed_count > 0:
-            self.progress_animating = False
-            self._set_real_progress()
-            return
         self.fake_progress = (self.fake_progress + 4) % 101
-        self.progress.configure(value=self.fake_progress)
+        self._draw_progress()
         self.after(60, self._animate_progress)
 
     def _set_real_progress(self) -> None:
         total = max(self.total_requests, 1)
         percent = int(max(0, min(100, self.completed_count * 100 / total)))
-        self.progress.configure(value=percent)
+        self.progress_percent = percent
+        if self.batch_stopping and self.running:
+            self.progress_text = f"已停止 {self.completed_count}/{self.total_requests}"
+        else:
+            self.progress_text = f"{self.completed_count}/{self.total_requests} {percent}%"
+        self._draw_progress()
+
+    def _draw_progress(self) -> None:
+        if self.progress_canvas is None:
+            return
+        canvas = self.progress_canvas
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#e6e6e6", outline="#b8b8b8")
+        if self.progress_animating and self.running and self.in_flight_count > 0:
+            segment_width = max(40, width // 5)
+            travel_width = width + segment_width
+            x1 = int((self.fake_progress / 100) * travel_width) - segment_width
+            x2 = x1 + segment_width
+            canvas.create_rectangle(max(0, x1), 1, min(width, x2), height - 1, fill="#2f80ed", outline="")
+        real_width = int(width * self.progress_percent / 100)
+        if real_width > 0:
+            canvas.create_rectangle(0, 1, real_width, height - 1, fill="#08b937", outline="")
+        canvas.create_text(width // 2, height // 2, text=self.progress_text, fill="#111111")
+
+    def _init_request_statuses(self, total: int, max_retry: int) -> None:
+        self.request_statuses = {}
+        if self.status_tree is not None:
+            for item in self.status_tree.get_children():
+                self.status_tree.delete(item)
+        for idx in range(1, total + 1):
+            self.request_statuses[idx] = {
+                "status": "等待中",
+                "elapsed": "",
+                "retry": f"0/{max_retry}",
+                "result": "",
+            }
+            if self.status_tree is not None:
+                self.status_tree.insert("", "end", iid=str(idx), values=(idx, "等待中", "", f"0/{max_retry}", ""))
+
+    def _update_request_status(
+        self,
+        idx: int,
+        status: Optional[str] = None,
+        elapsed: Optional[float] = None,
+        retry_used: Optional[int] = None,
+        max_retry: Optional[int] = None,
+        result: Optional[str] = None,
+    ) -> None:
+        info = self.request_statuses.setdefault(idx, {"status": "等待中", "elapsed": "", "retry": "", "result": ""})
+        if status is not None:
+            info["status"] = status
+        if elapsed is not None:
+            info["elapsed"] = f"{elapsed:.1f}s"
+        if retry_used is not None:
+            if max_retry is None:
+                max_retry = safe_int(str(info.get("retry", "0/0")).split("/")[-1], 0, 0, 5)
+            info["retry"] = f"{retry_used}/{max_retry}"
+        if result is not None:
+            info["result"] = self._short_result(result)
+        if self.status_tree is not None:
+            values = (idx, info.get("status", ""), info.get("elapsed", ""), info.get("retry", ""), info.get("result", ""))
+            iid = str(idx)
+            if self.status_tree.exists(iid):
+                self.status_tree.item(iid, values=values)
+            else:
+                self.status_tree.insert("", "end", iid=iid, values=values)
+            self.status_tree.see(iid)
+
+    def _short_result(self, result: str, limit: int = 120) -> str:
+        result = " ".join(str(result).split())
+        return result if len(result) <= limit else result[: limit - 3] + "..."
+
+    def _update_stop_waiting_status(self) -> None:
+        if self.batch_stopping and self.running:
+            self.elapsed_var.set(f"停止中：等待 {self.in_flight_count} 个已发请求返回")
 
     def _update_elapsed_timer(self) -> None:
         if self.batch_started_at is None:
             self.elapsed_var.set("耗时:0.0s")
             return
         elapsed = time.time() - self.batch_started_at
-        self.elapsed_var.set(f"耗时:{elapsed:.1f}s")
+        if self.batch_stopping and self.running:
+            self.elapsed_var.set(f"停止中：等待 {self.in_flight_count} 个已发请求返回")
+        else:
+            self.elapsed_var.set(f"耗时:{elapsed:.1f}s")
         if self.elapsed_timer_running:
             self.after(200, self._update_elapsed_timer)
 
-    def _run_batch(self, settings: RequestSettings, total: int, concurrency: int) -> None:
+    def _run_batch(self, settings: RequestSettings, prompts: List[str], concurrency: int) -> None:
         started_at = time.time()
+        total = len(prompts)
         next_index = 1
         futures: Dict[Any, int] = {}
         executor = ThreadPoolExecutor(max_workers=concurrency)
+
+        def submit_one(idx: int) -> None:
+            prompt_settings = replace(settings, prompt=prompts[idx - 1])
+            self.log_queue.put(("status", (idx, "进行中", None, 0, settings.retry_count, "")))
+            futures[executor.submit(self._run_one_request, prompt_settings, idx)] = idx
+
         try:
             while next_index <= total and len(futures) < concurrency and not self.stop_event.is_set():
-                futures[executor.submit(self._run_one_request, settings, next_index)] = next_index
+                submit_one(next_index)
                 next_index += 1
             while futures:
                 done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
                 for fut in done:
                     idx = futures.pop(fut)
                     try:
-                        ok, elapsed, msg = fut.result()
+                        ok, elapsed, msg, prompt, retry_used, status = fut.result()
                     except Exception as exc:
-                        ok, elapsed, msg = False, 0.0, f"未捕获异常: {exc}\n{traceback.format_exc()}"
-                    self.log_queue.put(("result", (idx, ok, elapsed, msg)))
+                        ok, elapsed, msg, prompt, retry_used, status = (
+                            False,
+                            0.0,
+                            f"未捕获异常: {exc}\n{traceback.format_exc()}",
+                            prompts[idx - 1] if idx - 1 < len(prompts) else settings.prompt,
+                            0,
+                            "失败",
+                        )
+                    self.log_queue.put(("result", (idx, ok, elapsed, msg, prompt, retry_used, status)))
                 while next_index <= total and len(futures) < concurrency and not self.stop_event.is_set():
-                    futures[executor.submit(self._run_one_request, settings, next_index)] = next_index
+                    submit_one(next_index)
                     next_index += 1
+            if self.stop_event.is_set() and next_index <= total:
+                for idx in range(next_index, total + 1):
+                    self.log_queue.put(("status", (idx, "已取消", None, None, settings.retry_count, "未提交")))
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
             self.log_queue.put(("done", time.time() - started_at))
 
-    def _run_one_request(self, settings: RequestSettings, index: int) -> Tuple[bool, float, str]:
+    def _run_one_request(self, settings: RequestSettings, index: int) -> Tuple[bool, float, str, str, int, str]:
         if self.stop_event.is_set():
             raise StopRequested("stop requested")
         started = time.time()
-        client = ImageApiClient(settings.base_url, settings.api_key)
-        try:
-            if settings.mode == "generate":
-                response = client.generate(self._build_generation_payload(settings))
-            elif is_grok_platform(settings.platform, settings.base_url):
-                response = client.edit_json(self._build_grok_edit_payload(settings))
-            else:
-                response = client.edit(self._build_edit_fields(settings), settings.image_paths)
-            saved_files = self._save_response_images(response, settings, index)
-            elapsed = time.time() - started
-            if saved_files:
-                return True, elapsed, "保存: " + "; ".join(saved_files)
-            return False, elapsed, f"响应中未找到 b64_json 或 url: {compact_json(response)}"
-        except Exception as exc:
-            return False, time.time() - started, str(exc)
+        retry_used = 0
+        last_message = ""
+        last_status = "失败"
+        for attempt in range(settings.retry_count + 1):
+            if self.stop_event.is_set() and attempt > 0:
+                break
+            attempt_started = time.time()
+            client = ImageApiClient(settings.base_url, settings.api_key, timeout=settings.timeout)
+            try:
+                if settings.mode == "generate":
+                    response = client.generate(self._build_generation_payload(settings))
+                elif is_grok_platform(settings.platform, settings.base_url):
+                    response = client.edit_json(self._build_grok_edit_payload(settings))
+                else:
+                    response = client.edit(self._build_edit_fields(settings), settings.image_paths)
+                saved_files = self._save_response_images(response, settings, index)
+                elapsed = time.time() - started
+                if saved_files:
+                    return True, elapsed, "保存: " + "; ".join(saved_files), settings.prompt, retry_used, "成功"
+                last_message = f"响应中未找到 b64_json 或 url: {compact_json(response)}"
+                last_status = "失败"
+            except Exception as exc:
+                last_message = str(exc)
+                last_status = "超时" if self._is_timeout_error(exc) else "失败"
+            if attempt < settings.retry_count and self._should_retry_error(last_message):
+                retry_used = attempt + 1
+                self.log_queue.put(("retry", (index, retry_used, settings.retry_count, last_message)))
+                if settings.retry_delay > 0:
+                    time.sleep(settings.retry_delay)
+                continue
+            break
+        return False, time.time() - started, last_message, settings.prompt, retry_used, last_status
+
+    def _is_timeout_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "超时" in str(exc) or "timed out" in text or "timeout" in text or isinstance(exc, (TimeoutError, socket.timeout))
+
+    def _should_retry_error(self, message: str) -> bool:
+        lower = message.lower()
+        retry_markers = ["网络超时", "timed out", "timeout", "connection reset", "temporarily", "网络错误"]
+        if any(marker in lower for marker in retry_markers):
+            return True
+        for code in (429, 500, 502, 503, 504):
+            if f"http {code}" in lower:
+                return True
+        for code in (400, 401, 403, 404):
+            if f"http {code}" in lower:
+                return False
+        return False
 
     def _build_generation_payload(self, settings: RequestSettings) -> Dict[str, Any]:
         if is_grok_platform(settings.platform, settings.base_url):
@@ -1294,7 +1744,7 @@ class GPTImageApp(tk.Tk):
             url = item.get("url")
             if url:
                 file_path = out_dir / f"{timestamp}_req{index:04d}_{image_idx}.{extension}"
-                self._download_image(url, file_path, settings.api_key)
+                self._download_image(url, file_path, settings.api_key, settings.timeout)
                 self._resize_saved_image_if_needed(file_path, settings)
                 saved.append(str(file_path))
         return saved
@@ -1334,13 +1784,21 @@ class GPTImageApp(tk.Tk):
         top = max(0, (new_size[1] - target_h) // 2)
         return resized.crop((left, top, left + target_w, top + target_h))
 
-    def _download_image(self, url: str, out_path: Path, api_key: str) -> None:
+    def _download_image(self, url: str, out_path: Path, api_key: str, timeout: int) -> None:
         headers = {"User-Agent": "GPTImageGeneratorStressPanel/1.0"}
         if urllib.parse.urlparse(url).netloc == urllib.parse.urlparse(normalize_base_url(self.base_url_var.get())).netloc:
             headers["Authorization"] = f"Bearer {api_key}"
         req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            out_path.write_bytes(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                out_path.write_bytes(resp.read())
+        except urllib.error.URLError as exc:
+            reason = exc.reason
+            if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason).lower():
+                raise ImageApiError(f"下载超时（超过 {timeout}s）") from exc
+            raise ImageApiError(f"下载失败: {reason}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise ImageApiError(f"下载超时（超过 {timeout}s）") from exc
 
     def _enqueue_log(self, message: str) -> None:
         self.log_queue.put(("log", message))
@@ -1351,37 +1809,67 @@ class GPTImageApp(tk.Tk):
                 kind, payload = self.log_queue.get_nowait()
                 if kind == "log":
                     self._append_log(str(payload))
+                elif kind == "status":
+                    idx, status, elapsed, retry_used, max_retry, result = payload
+                    old_status = self.request_statuses.get(idx, {}).get("status")
+                    if old_status != "进行中" and status == "进行中":
+                        self.in_flight_count += 1
+                    self._update_request_status(idx, status=status, elapsed=elapsed, retry_used=retry_used, max_retry=max_retry, result=result)
+                    self._update_stats()
+                    self._draw_progress()
+                    self._update_stop_waiting_status()
+                elif kind == "retry":
+                    idx, retry_used, max_retry, reason = payload
+                    self._update_request_status(idx, status="进行中", retry_used=retry_used, max_retry=max_retry, result=f"重试中: {reason}")
+                    self._append_log(f"[#{idx}] 第 {retry_used}/{max_retry} 次重试，原因: {reason}")
                 elif kind == "result":
-                    idx, ok, elapsed, msg = payload
+                    idx, ok, elapsed, msg, prompt, retry_used, status = payload
                     self.completed_count += 1
+                    self.in_flight_count = max(0, self.in_flight_count - 1)
                     self.total_elapsed += elapsed
+                    self.fastest_elapsed = elapsed if self.fastest_elapsed is None else min(self.fastest_elapsed, elapsed)
+                    self.slowest_elapsed = elapsed if self.slowest_elapsed is None else max(self.slowest_elapsed, elapsed)
                     if ok:
                         self.success_count += 1
+                        final_status = "成功"
                         self._append_log(f"[#{idx}] 成功 {elapsed:.1f}s | {msg}")
-                        if not self.batch_history_recorded and self.batch_prompt_for_history:
-                            self._record_prompt_history(self.batch_prompt_for_history)
-                            self.batch_history_recorded = True
-                            self._append_log("已保存提示词历史")
+                        if self.prompt_mode_var.get() == "lines":
+                            self._record_prompt_history(str(prompt))
+                        else:
+                            self._record_batch_prompt_history_once(str(prompt))
                     else:
                         self.fail_count += 1
-                        self._append_log(f"[#{idx}] 失败 {elapsed:.1f}s | {msg}")
-                    self.progress_animating = False
+                        final_status = status or "失败"
+                        self._append_log(f"[#{idx}] {final_status} {elapsed:.1f}s | {msg}")
+                    max_retry = safe_int(str(self.request_statuses.get(idx, {}).get("retry", "0/0")).split("/")[-1], 0, 0, 5)
+                    self._update_request_status(idx, status=final_status, elapsed=elapsed, retry_used=retry_used, max_retry=max_retry, result=msg)
                     self._set_real_progress()
                     self._update_stats()
+                    self._update_stop_waiting_status()
                 elif kind == "done":
                     elapsed_total = float(payload)
                     self.progress_animating = False
+                    self.in_flight_count = 0
                     self.elapsed_timer_running = False
+                    if self.batch_stopping and self.completed_count < self.total_requests:
+                        self.progress_text = f"已停止 {self.completed_count}/{self.total_requests}"
+                    else:
+                        self._set_real_progress()
+                        if self.completed_count >= self.total_requests:
+                            self.progress_percent = 100
+                            self.progress_text = f"{self.total_requests}/{self.total_requests} 100%"
+                    self._draw_progress()
                     self.elapsed_var.set(f"耗时:{elapsed_total:.1f}s")
-                    self._set_real_progress()
-                    if self.completed_count >= self.total_requests:
-                        self.progress.configure(value=100)
+                    if self.success_count > 0 and self.prompt_mode_var.get() != "lines":
+                        self._record_batch_prompt_history_once()
                     self._append_log(f"完成 | 成功:{self.success_count} 失败:{self.fail_count}/{self.total_requests} 总耗时:{elapsed_total:.1f}s")
                     self.running = False
+                    self.batch_stopping = False
                     self.batch_prompt_for_history = ""
                     self.batch_history_recorded = False
                     self.start_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
+                    self._update_stats()
         except queue.Empty:
             pass
         self.after(100, self._poll_log_queue)
@@ -1395,13 +1883,30 @@ class GPTImageApp(tk.Tk):
 
     def _update_stats(self) -> None:
         avg = self.total_elapsed / self.completed_count if self.completed_count else 0.0
-        self.stats_var.set(f"成功:{self.success_count} 失败:{self.fail_count} 平均:{avg:.1f}s")
+        success_rate = (self.success_count * 100 / self.completed_count) if self.completed_count else 0.0
+        fastest = f"{self.fastest_elapsed:.1f}s" if self.fastest_elapsed is not None else "--"
+        slowest = f"{self.slowest_elapsed:.1f}s" if self.slowest_elapsed is not None else "--"
+        if self.completed_count and self.running:
+            remaining = max(self.total_requests - self.completed_count, 0)
+            eta = f"{remaining * avg:.1f}s"
+        else:
+            eta = "--"
+        self.stats_var.set(
+            f"成功:{self.success_count} 失败:{self.fail_count} 进行中:{self.in_flight_count} "
+            f"成功率:{success_rate:.0f}% 平均:{avg:.1f}s 最快:{fastest} 最慢:{slowest} ETA:{eta}"
+        )
 
 
 def main() -> None:
     root = GPTImageApp()
     try:
-        root.option_add("*Font", "Microsoft YaHei UI 9")
+        from tkinter import font as tkfont
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(name).configure(family="Microsoft YaHei UI", size=9)
+            except Exception:
+                pass
+        root.option_add("*Font", "{Microsoft YaHei UI} 9")
     except Exception:
         pass
     root.mainloop()

@@ -3,3 +3,5 @@ config.ini
 .npm-cache
 .pip-cache
 .pydeps
+# 历史文件
+prompt_history.json
