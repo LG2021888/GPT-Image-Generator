@@ -11,6 +11,8 @@ set TK_LIBRARY=C:\Users\57276\.cache\codex-runtimes\codex-primary-runtime\depend
 
 set OUT_DIR=dist\GPTImageGenerator
 set OLD_OUT_DIR=dist\GPT Image Generator
+set BUILD_DIST=.build_dist
+set BUILD_OUT=%BUILD_DIST%\GPTImageGenerator
 set KEEP=%CD%\.release_keep
 
 if exist "%KEEP%" rmdir /s /q "%KEEP%"
@@ -32,19 +34,40 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "$targets=@((Resolve-Path
 timeout /t 1 /nobreak >nul 2>nul
 
 if exist ".build_tmp" rmdir /s /q ".build_tmp"
-if exist "%OLD_OUT_DIR%" rmdir /s /q "%OLD_OUT_DIR%"
-if exist "%OUT_DIR%" rmdir /s /q "%OUT_DIR%"
+if exist "%BUILD_DIST%" rmdir /s /q "%BUILD_DIST%"
 
-if exist "%OLD_OUT_DIR%" (
-  echo Failed to remove "%OLD_OUT_DIR%". Please close any running packaged app or Explorer window inside it, then retry.
+if exist ".build_tmp" (
+  echo Failed to remove ".build_tmp". Please close any process using it, then retry.
   exit /b 1
 )
-if exist "%OUT_DIR%" (
-  echo Failed to remove "%OUT_DIR%". Please close any running packaged app or Explorer window inside it, then retry.
+if exist "%BUILD_DIST%" (
+  echo Failed to remove "%BUILD_DIST%". Please close any process using it, then retry.
   exit /b 1
 )
 
-"%PY%" -m PyInstaller --noconfirm --clean --onedir --windowed --name "GPTImageGenerator" --distpath dist --workpath .build_tmp --specpath .build_tmp --paths "%PYTHONHOME%\Lib" --paths "%PYTHONHOME%\DLLs" --hidden-import tkinter --hidden-import tkinter.ttk --hidden-import tkinter.filedialog --hidden-import tkinter.messagebox --collect-submodules tkinter --add-binary "%PYTHONHOME%\DLLs\_tkinter.pyd;." --add-binary "%PYTHONHOME%\DLLs\tcl86t.dll;." --add-binary "%PYTHONHOME%\DLLs\tk86t.dll;." --add-data "%PYTHONHOME%\Lib\tkinter;tkinter" --add-data "%PYTHONHOME%\tcl\tcl8.6;tcl\tcl8.6" --add-data "%PYTHONHOME%\tcl\tk8.6;tcl\tk8.6" app\gpt_image_generator.py
+"%PY%" -m PyInstaller --noconfirm --clean --onedir --windowed --name "GPTImageGenerator" --distpath "%BUILD_DIST%" --workpath .build_tmp --specpath .build_tmp --paths "%PYTHONHOME%\Lib" --paths "%PYTHONHOME%\DLLs" --hidden-import tkinter --hidden-import tkinter.ttk --hidden-import tkinter.filedialog --hidden-import tkinter.messagebox --collect-submodules tkinter --add-binary "%PYTHONHOME%\DLLs\_tkinter.pyd;." --add-binary "%PYTHONHOME%\DLLs\tcl86t.dll;." --add-binary "%PYTHONHOME%\DLLs\tk86t.dll;." --add-data "%PYTHONHOME%\Lib\tkinter;tkinter" --add-data "%PYTHONHOME%\tcl\tcl8.6;tcl\tcl8.6" --add-data "%PYTHONHOME%\tcl\tk8.6;tcl\tk8.6" app\gpt_image_generator.py
+if errorlevel 1 exit /b %errorlevel%
+
+if not exist "%OUT_DIR%" mkdir "%OUT_DIR%" >nul 2>nul
+
+rem Replace only packaged program artifacts. Never delete runtime user data:
+rem   config.ini, prompt_history.json, output\
+if exist "%OUT_DIR%\GPTImageGenerator.exe" del /f /q "%OUT_DIR%\GPTImageGenerator.exe"
+if exist "%OUT_DIR%\_internal" rmdir /s /q "%OUT_DIR%\_internal"
+if exist "%OUT_DIR%\_tcl_data" rmdir /s /q "%OUT_DIR%\_tcl_data"
+if exist "%OUT_DIR%\_tk_data" rmdir /s /q "%OUT_DIR%\_tk_data"
+if exist "%OUT_DIR%\tcl8" rmdir /s /q "%OUT_DIR%\tcl8"
+
+if exist "%OUT_DIR%\GPTImageGenerator.exe" (
+  echo Failed to replace "%OUT_DIR%\GPTImageGenerator.exe". Please close any running packaged app, then retry.
+  exit /b 1
+)
+if exist "%OUT_DIR%\_internal" (
+  echo Failed to replace "%OUT_DIR%\_internal". Please close any Explorer window or running app inside it, then retry.
+  exit /b 1
+)
+
+xcopy /E /I /Y "%BUILD_OUT%\*" "%OUT_DIR%\" >nul
 if errorlevel 1 exit /b %errorlevel%
 
 if exist "%KEEP%\config.ini" copy /Y "%KEEP%\config.ini" "%OUT_DIR%\config.ini" >nul
@@ -52,6 +75,7 @@ if exist "%KEEP%\prompt_history.json" copy /Y "%KEEP%\prompt_history.json" "%OUT
 if exist "%KEEP%\output" xcopy /E /I /Y "%KEEP%\output" "%OUT_DIR%\output" >nul
 if exist "%KEEP%" rmdir /s /q "%KEEP%"
 if exist ".build_tmp" rmdir /s /q ".build_tmp"
+if exist "%BUILD_DIST%" rmdir /s /q "%BUILD_DIST%"
 
 echo Build complete: %CD%\%OUT_DIR%
 endlocal

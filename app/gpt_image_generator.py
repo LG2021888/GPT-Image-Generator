@@ -29,7 +29,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, TimeoutError as FutureTimeoutError, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +63,7 @@ PRESET_SIZES = [
     "1024x1536",
     "2048x2048",
     "2048x1152",
+    "1152x2048",
     "3840x2160",
     "2160x3840",
 ]
@@ -95,7 +96,8 @@ class RequestSettings:
     compression: int
     model: str
     output_dir: str
-    timeout: int
+    background_after_seconds: int
+    hard_timeout_seconds: int
     retry_count: int
     retry_delay: int
 
@@ -439,6 +441,29 @@ def app_base_dir() -> Path:
     return Path.cwd()
 
 
+def default_output_dir() -> Path:
+    return (app_base_dir() / "output").resolve()
+
+
+def resolve_initial_output_dir(saved_output_dir: str = "") -> str:
+    current_output = default_output_dir()
+    saved = str(saved_output_dir or "").strip()
+    if current_output.exists():
+        return str(current_output)
+    if not saved:
+        return str(current_output)
+    try:
+        saved_path = Path(saved).expanduser()
+        parts = {part.lower() for part in saved_path.parts}
+        if saved_path.name.lower() == "output" and {"gptimagegenerator", "gpt image generator"} & parts:
+            return str(current_output)
+        if saved_path.exists():
+            return str(saved_path.resolve())
+    except Exception:
+        pass
+    return str(current_output)
+
+
 class GPTImageApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -468,11 +493,16 @@ class GPTImageApp(tk.Tk):
         self.status_tree: Optional[ttk.Treeview] = None
         self.request_statuses: Dict[int, Dict[str, Any]] = {}
         self.in_flight_count = 0
+        self.background_wait_count = 0
+        self.background_wait_limit = 0
+        self.background_lock = threading.Lock()
+        self.closed_forcefully = False
         self.fastest_elapsed: Optional[float] = None
         self.slowest_elapsed: Optional[float] = None
         self.batch_stopping = False
         self.batch_started_at: Optional[float] = None
         self.elapsed_timer_running = False
+        self.elapsed_timer_token = 0
         self.batch_prompt_for_history = ""
         self.batch_history_recorded = False
         self.success_count = 0
@@ -482,11 +512,14 @@ class GPTImageApp(tk.Tk):
         self.total_requests = 1
         self.batch_concurrency = 1
         self.batch_timeout = 80
+        self.current_batch_id = 0
+        self.background_wait_by_batch: Dict[int, int] = {}
 
         self._init_vars()
         self._build_ui()
         self._load_config()
         self._on_mode_change()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_log_queue()
 
     def _init_vars(self) -> None:
@@ -509,11 +542,25 @@ class GPTImageApp(tk.Tk):
         self.concurrency_var = tk.IntVar(value=1)
         self.retry_count_var = tk.IntVar(value=0)
         self.retry_delay_var = tk.IntVar(value=3)
-        self.timeout_var = tk.IntVar(value=80)
+        self.background_after_var = tk.IntVar(value=120)
+        self.hard_timeout_var = tk.IntVar(value=1800)
+        self.timeout_var = self.background_after_var
         self.prompt_mode_var = tk.StringVar(value="repeat")
-        default_output = str((Path.cwd() / "output").resolve())
+        default_output = resolve_initial_output_dir()
         self.output_dir_var = tk.StringVar(value=default_output)
-        self.stats_var = tk.StringVar(value="成功:0 失败:0 进行中:0 成功率:0% 平均:0.0s 最快:-- 最慢:-- 预计剩余:--")
+        self.stats_vars = {
+            "success": tk.StringVar(value="\u6210\u529f:0"),
+            "fail": tk.StringVar(value="\u5931\u8d25:0"),
+            "running": tk.StringVar(value="\u8fdb\u884c\u4e2d:0"),
+            "background": tk.StringVar(value="\u540e\u53f0:0"),
+            "rate": tk.StringVar(value="\u6210\u529f\u7387:0%"),
+            "avg": tk.StringVar(value="\u5e73\u5747:0.0s"),
+            "fastest": tk.StringVar(value="\u6700\u5feb:--"),
+            "slowest": tk.StringVar(value="\u6700\u6162:--"),
+            "eta": tk.StringVar(value="\u9884\u8ba1\u5269\u4f59:--"),
+        }
+        self.stats_var = self.stats_vars["success"]
+        self.eta_var = self.stats_vars["eta"]
         self.elapsed_var = tk.StringVar(value="耗时:0.0s")
 
     def _build_ui(self) -> None:
@@ -535,7 +582,7 @@ class GPTImageApp(tk.Tk):
 
     def _build_api_frame(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.LabelFrame(parent, text="API 配置", padding=6)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 2))
         frame.columnconfigure(1, weight=1)
         frame.columnconfigure(3, weight=1)
         ttk.Label(frame, text="配置:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
@@ -689,8 +736,12 @@ class GPTImageApp(tk.Tk):
         ttk.Spinbox(frame, from_=0, to=5, textvariable=self.retry_count_var, width=8).grid(row=1, column=1, sticky="w", padx=(4, 16), pady=3)
         ttk.Label(frame, text="重试间隔(s):").grid(row=1, column=2, sticky="w", pady=3)
         ttk.Spinbox(frame, from_=0, to=60, textvariable=self.retry_delay_var, width=8).grid(row=1, column=3, sticky="w", padx=(4, 16), pady=3)
-        ttk.Label(frame, text="超时秒数:").grid(row=1, column=4, sticky="w", pady=3)
-        ttk.Spinbox(frame, from_=10, to=1800, textvariable=self.timeout_var, width=8).grid(row=1, column=5, sticky="w", padx=(4, 6), pady=3)
+        wait_frame = ttk.Frame(frame)
+        wait_frame.grid(row=1, column=4, columnspan=4, sticky="w", pady=3)
+        ttk.Label(wait_frame, text="\u540e\u53f0\u7b49\u5f85\u9608\u503c(\u79d2):").pack(side="left")
+        ttk.Spinbox(wait_frame, from_=1, to=1800, textvariable=self.background_after_var, width=8).pack(side="left", padx=(4, 14))
+        ttk.Label(wait_frame, text="\u540e\u53f0\u6700\u957f\u7b49\u5f85(\u79d2):").pack(side="left")
+        ttk.Spinbox(wait_frame, from_=1, to=7200, textvariable=self.hard_timeout_var, width=8).pack(side="left", padx=(4, 0))
 
     def _build_control_frame(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.Frame(parent)
@@ -704,7 +755,15 @@ class GPTImageApp(tk.Tk):
         self.progress_canvas.grid(row=0, column=2, sticky="ew", padx=(0, 12))
         self.progress_canvas.bind("<Configure>", lambda _event: self._draw_progress())
         ttk.Label(frame, textvariable=self.elapsed_var).grid(row=0, column=3, sticky="e")
-        ttk.Label(frame, textvariable=self.stats_var, anchor="w").grid(row=1, column=2, columnspan=2, sticky="ew", pady=(3, 0))
+        stats_frame = ttk.Frame(frame)
+        stats_frame.grid(row=1, column=0, columnspan=4, sticky="ew", padx=(0, 0), pady=(6, 0))
+        stat_keys = ("success", "fail", "running", "background", "rate", "avg", "fastest", "slowest", "eta")
+        for stat_col, key in enumerate(stat_keys):
+            stats_frame.columnconfigure(stat_col, weight=1, uniform="stats")
+            anchor = "e" if key == "eta" else "center"
+            ttk.Label(stats_frame, textvariable=self.stats_vars[key], anchor=anchor).grid(
+                row=0, column=stat_col, sticky="ew", padx=3
+            )
 
     def _build_status_frame(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.LabelFrame(parent, text="请求状态", padding=6)
@@ -1019,8 +1078,26 @@ class GPTImageApp(tk.Tk):
         except Exception as exc:
             self._enqueue_log(f"保存提示词历史失败: {exc}")
 
+    def _record_started_prompt_history(self, prompts: List[str], raw_prompt: str) -> None:
+        if self.prompt_mode_var.get() == "lines":
+            items = [prompt.strip() for prompt in prompts if prompt.strip()]
+        else:
+            items = [raw_prompt.strip()]
+        items = [item for item in items if item and item != DEFAULT_PROMPT_TEXT]
+        if not items:
+            return
+        new_history = self._normalize_prompt_history(items + self.prompt_history)
+        if new_history == self.prompt_history:
+            return
+        self.prompt_history = new_history
+        try:
+            self._write_prompt_history_to_disk(self.prompt_history)
+            self._refresh_prompt_history_window()
+        except Exception as exc:
+            self._enqueue_log(f"\u4fdd\u5b58\u63d0\u793a\u8bcd\u5386\u53f2\u5931\u8d25: {exc}")
+
     def _record_batch_prompt_history_once(self, prompt: str = "") -> None:
-        prompt = (prompt or self.batch_prompt_for_history).strip()
+        prompt = (self.batch_prompt_for_history or prompt).strip()
         if self.batch_history_recorded or not prompt or prompt == DEFAULT_PROMPT_TEXT:
             return
         self._record_prompt_history(prompt)
@@ -1093,7 +1170,7 @@ class GPTImageApp(tk.Tk):
         if current not in self.profiles:
             current = next(iter(self.profiles))
 
-        self.output_dir_var.set(app_sec.get("output_dir", self.output_dir_var.get()))
+        self.output_dir_var.set(resolve_initial_output_dir(app_sec.get("output_dir", self.output_dir_var.get())))
         saved_size = app_sec.get("size_preset", PRESET_SIZES[0])
         self.size_preset_var.set(PRESET_SIZES[0] if saved_size.startswith(("auto", "自动")) else saved_size)
         self.custom_size_var.set(app_sec.get("custom_size", ""))
@@ -1103,6 +1180,8 @@ class GPTImageApp(tk.Tk):
         self.format_var.set(app_sec.get("output_format", "jpeg"))
         self.compression_var.set(safe_int(app_sec.get("compression", 100), 100, 0, 100))
         self.mode_var.set(app_sec.get("mode", "edit"))
+        self.background_after_var.set(safe_int(app_sec.get("background_after_seconds", app_sec.get("timeout", 120)), 120, 1, 1800))
+        self.hard_timeout_var.set(safe_int(app_sec.get("hard_timeout_seconds", 1800), 1800, 1, 7200))
         self.prompt_history = self._load_prompt_history(cfg)
 
         self._refresh_profile_menu(current)
@@ -1181,6 +1260,8 @@ class GPTImageApp(tk.Tk):
             "output_format": self.format_var.get(),
             "compression": str(safe_int(self.compression_var.get(), 100, 0, 100)),
             "mode": self.mode_var.get(),
+            "background_after_seconds": str(safe_int(self.background_after_var.get(), 120, 1, 1800)),
+            "hard_timeout_seconds": str(safe_int(self.hard_timeout_var.get(), 1800, 1, 7200)),
         }
         if not self.profiles:
             self.profiles[DEFAULT_PROFILE] = {
@@ -1302,12 +1383,12 @@ class GPTImageApp(tk.Tk):
             self.clear_images_button.configure(state="normal" if self.selected_images else "disabled")
 
     def _select_output_dir(self) -> None:
-        path = filedialog.askdirectory(title="选择输出目录", initialdir=self.output_dir_var.get() or str(Path.cwd()))
+        path = filedialog.askdirectory(title="\u9009\u62e9\u8f93\u51fa\u76ee\u5f55", initialdir=self.output_dir_var.get() or str(default_output_dir()))
         if path:
             self.output_dir_var.set(path)
 
     def _open_output_dir(self) -> None:
-        path = Path(self.output_dir_var.get().strip() or (Path.cwd() / "output")).resolve()
+        path = Path(self.output_dir_var.get().strip() or default_output_dir()).resolve()
         try:
             path.mkdir(parents=True, exist_ok=True)
             if sys.platform.startswith("win"):
@@ -1341,8 +1422,9 @@ class GPTImageApp(tk.Tk):
             output_format=self.format_var.get().strip() or "png",
             compression=safe_int(self.compression_var.get(), 100, 0, 100),
             model=self.model_var.get().strip() or DEFAULT_MODEL,
-            output_dir=self.output_dir_var.get().strip() or str((Path.cwd() / "output").resolve()),
-            timeout=safe_int(self.timeout_var.get(), 80, 10, 1800),
+            output_dir=self.output_dir_var.get().strip() or str(default_output_dir()),
+            background_after_seconds=safe_int(self.background_after_var.get(), 120, 1, 1800),
+            hard_timeout_seconds=safe_int(self.hard_timeout_var.get(), 1800, 1, 7200),
             retry_count=safe_int(self.retry_count_var.get(), 0, 0, 5),
             retry_delay=safe_int(self.retry_delay_var.get(), 3, 0, 60),
         )
@@ -1360,6 +1442,8 @@ class GPTImageApp(tk.Tk):
             return "Grok/xAI 图生图最多建议选择 3 张输入图片。"
         if settings.image_count not in {1, 2, 3}:
             return "生成张数只能选择 1、2 或 3。"
+        if settings.hard_timeout_seconds <= settings.background_after_seconds:
+            return "后台最长等待必须大于后台等待阈值。"
         total = sum(Path(p).stat().st_size for p in settings.image_paths if Path(p).exists())
         if total > MAX_INPUT_BYTES:
             return f"输入图片总大小 {human_size(total)}，超过 30MB 限制。"
@@ -1394,9 +1478,14 @@ class GPTImageApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("输出目录错误", str(exc))
             return
+        existing_background = self.background_wait_count
+        self._record_started_prompt_history(prompts, settings.prompt)
+        self.current_batch_id += 1
+        batch_id = self.current_batch_id
+        batch_stop_event = threading.Event()
+        self.stop_event = batch_stop_event
         self.running = True
         self.batch_stopping = False
-        self.stop_event.clear()
         self.batch_prompt_for_history = prompts[0] if prompts else settings.prompt
         self.batch_history_recorded = False
         self.success_count = 0
@@ -1409,18 +1498,18 @@ class GPTImageApp(tk.Tk):
         self.total_requests = len(prompts)
         concurrency = min(safe_int(self.concurrency_var.get(), 1, 1, 100), self.total_requests)
         self.batch_concurrency = max(1, concurrency)
-        self.batch_timeout = max(1, settings.timeout)
+        self.batch_timeout = max(1, settings.background_after_seconds)
+        self.background_wait_limit = min(20, max(4, concurrency * 2))
         expected_images = self.total_requests * max(1, settings.image_count)
         self._init_request_statuses(self.total_requests, settings.retry_count)
         self.batch_started_at = time.time()
-        self.elapsed_timer_running = True
         self.progress_percent = 0
         self.progress_text = f"0/{self.total_requests} 0%"
         self.fake_progress = 0
         self.progress_animating = True
         self._draw_progress()
         self._update_stats()
-        self._update_elapsed_timer()
+        self._start_elapsed_timer()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         platform_name = platform_api_to_label(settings.platform)
@@ -1430,8 +1519,10 @@ class GPTImageApp(tk.Tk):
             f"单次张数:{settings.image_count} 预计生成:{expected_images} 张 "
             f"尺寸:{size_label(settings.size)} 质量:{settings.quality} "
             f"风格:{style_name} 格式:{settings.output_format} 模型:{settings.model} "
-            f"重试:{settings.retry_count} 间隔:{settings.retry_delay}s 超时:{settings.timeout}s"
+            f"\u91cd\u8bd5:{settings.retry_count} \u95f4\u9694:{settings.retry_delay}s \u540e\u53f0\u9608\u503c:{settings.background_after_seconds}s \u540e\u53f0\u6700\u957f:{settings.hard_timeout_seconds}s"
         )
+        if existing_background > 0:
+            self._enqueue_log(f"已有 {existing_background} 个旧后台请求未返回；新批次照常开始，旧后台完成只自动保存并写日志，不计入本批统计。")
         if should_resize_output(settings):
             self._enqueue_log(f"已启用本地尺寸校正：服务商返回非目标尺寸时会保存后调整为 {settings.size}")
         if is_grok_platform(settings.platform, settings.base_url) and settings.mode == "generate" and settings.size != "auto":
@@ -1441,7 +1532,7 @@ class GPTImageApp(tk.Tk):
             )
         self._enqueue_log(f"接口: {settings.base_url}/images/{'edits' if settings.mode == 'edit' else 'generations'}")
         self._animate_progress()
-        self.worker_thread = threading.Thread(target=self._run_batch, args=(settings, prompts, concurrency), daemon=True)
+        self.worker_thread = threading.Thread(target=self._run_batch, args=(settings, prompts, concurrency, batch_id, batch_stop_event), daemon=True)
         self.worker_thread.start()
 
     def _build_batch_prompts(self, prompt: str) -> List[str]:
@@ -1553,34 +1644,57 @@ class GPTImageApp(tk.Tk):
 
     def _update_stop_waiting_status(self) -> None:
         if self.batch_stopping and self.running:
-            self.elapsed_var.set(f"停止中：等待 {self.in_flight_count} 个已发请求返回")
+            self.elapsed_var.set(f"\u505c\u6b62\u4e2d\uff1a\u524d\u53f0 {self.in_flight_count}\uff0c\u540e\u53f0 {self.background_wait_count}")
 
-    def _update_elapsed_timer(self) -> None:
+    def _start_elapsed_timer(self) -> None:
+        self.elapsed_timer_token += 1
+        self.elapsed_timer_running = True
+        self._update_elapsed_timer(self.elapsed_timer_token)
+
+    def _stop_elapsed_timer(self) -> None:
+        self.elapsed_timer_token += 1
+        self.elapsed_timer_running = False
+
+    def _update_elapsed_timer(self, token: Optional[int] = None) -> None:
+        if token is None:
+            token = self.elapsed_timer_token
+        if token != self.elapsed_timer_token:
+            return
         if self.batch_started_at is None:
-            self.elapsed_var.set("耗时:0.0s")
+            self.elapsed_var.set("\u8017\u65f6:0.0s")
             return
         elapsed = time.time() - self.batch_started_at
-        if self.batch_stopping and self.running:
-            self.elapsed_var.set(f"停止中：等待 {self.in_flight_count} 个已发请求返回")
+        if self.background_wait_count > 0 and not self.running:
+            self.elapsed_var.set(f"\u540e\u53f0\u7b49\u5f85\u4e2d\uff1a{self.background_wait_count} \u4e2a\uff0c\u8017\u65f6:{elapsed:.1f}s")
+        elif self.batch_stopping and self.running:
+            self.elapsed_var.set(f"\u505c\u6b62\u4e2d\uff1a\u524d\u53f0 {self.in_flight_count}\uff0c\u540e\u53f0 {self.background_wait_count}")
         else:
-            self.elapsed_var.set(f"耗时:{elapsed:.1f}s")
+            self.elapsed_var.set(f"\u8017\u65f6:{elapsed:.1f}s")
         if self.elapsed_timer_running:
-            self.after(200, self._update_elapsed_timer)
+            self.after(200, lambda token=token: self._update_elapsed_timer(token))
 
-    def _run_batch(self, settings: RequestSettings, prompts: List[str], concurrency: int) -> None:
+    def _run_batch(
+        self,
+        settings: RequestSettings,
+        prompts: List[str],
+        concurrency: int,
+        batch_id: int,
+        stop_event: threading.Event,
+    ) -> None:
         started_at = time.time()
         total = len(prompts)
         next_index = 1
         futures: Dict[Any, int] = {}
-        executor = ThreadPoolExecutor(max_workers=concurrency)
+        scheduler_executor = ThreadPoolExecutor(max_workers=concurrency)
+        request_executor = ThreadPoolExecutor(max_workers=max(concurrency, self.background_wait_limit, 1))
 
         def submit_one(idx: int) -> None:
             prompt_settings = replace(settings, prompt=prompts[idx - 1])
-            self.log_queue.put(("status", (idx, "进行中", None, 0, settings.retry_count, "")))
-            futures[executor.submit(self._run_one_request, prompt_settings, idx)] = idx
+            self.log_queue.put(("status", (batch_id, idx, "进行中", None, 0, settings.retry_count, "")))
+            futures[scheduler_executor.submit(self._run_one_with_background, request_executor, prompt_settings, idx, batch_id, stop_event)] = idx
 
         try:
-            while next_index <= total and len(futures) < concurrency and not self.stop_event.is_set():
+            while next_index <= total and len(futures) < concurrency and not stop_event.is_set():
                 submit_one(next_index)
                 next_index += 1
             while futures:
@@ -1598,29 +1712,94 @@ class GPTImageApp(tk.Tk):
                             0,
                             "失败",
                         )
-                    self.log_queue.put(("result", (idx, ok, elapsed, msg, prompt, retry_used, status)))
-                while next_index <= total and len(futures) < concurrency and not self.stop_event.is_set():
+                    self.log_queue.put(("result", (batch_id, idx, ok, elapsed, msg, prompt, retry_used, status)))
+                while next_index <= total and len(futures) < concurrency and not stop_event.is_set():
                     submit_one(next_index)
                     next_index += 1
-            if self.stop_event.is_set() and next_index <= total:
+            if stop_event.is_set() and next_index <= total:
                 for idx in range(next_index, total + 1):
-                    self.log_queue.put(("status", (idx, "已取消", None, None, settings.retry_count, "未提交")))
+                    self.log_queue.put(("status", (batch_id, idx, "已取消", None, None, settings.retry_count, "未提交")))
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-            self.log_queue.put(("done", time.time() - started_at))
+            scheduler_executor.shutdown(wait=False, cancel_futures=True)
+            request_executor.shutdown(wait=False, cancel_futures=False)
+            self.log_queue.put(("done", (batch_id, time.time() - started_at)))
 
-    def _run_one_request(self, settings: RequestSettings, index: int) -> Tuple[bool, float, str, str, int, str]:
-        if self.stop_event.is_set():
+    def _run_one_with_background(
+        self,
+        request_executor: ThreadPoolExecutor,
+        settings: RequestSettings,
+        index: int,
+        batch_id: int,
+        stop_event: threading.Event,
+    ) -> Tuple[bool, float, str, str, int, str]:
+        request_future = request_executor.submit(self._run_one_request, settings, index, batch_id, stop_event)
+        soft_timeout = max(1, settings.background_after_seconds)
+        try:
+            return request_future.result(timeout=soft_timeout)
+        except FutureTimeoutError:
+            if not self._try_enter_background(batch_id):
+                self.log_queue.put(("log", f"[#{index}] 后台等待已满，继续占用前台槽等待返回"))
+                return request_future.result()
+            self.log_queue.put(("background", (batch_id, index, soft_timeout, settings.retry_count, "转入后台等待")))
+            request_future.add_done_callback(lambda fut, idx=index, bid=batch_id: self._on_background_request_done(bid, idx, fut))
+            return False, float(soft_timeout), "已转入后台等待，返回后会自动保存。", settings.prompt, 0, "后台等待"
+
+    def _try_enter_background(self, batch_id: int) -> bool:
+        with self.background_lock:
+            if self.background_wait_count >= self.background_wait_limit:
+                return False
+            self.background_wait_count += 1
+            self.background_wait_by_batch[batch_id] = self.background_wait_by_batch.get(batch_id, 0) + 1
+            return True
+
+    def _leave_background(self, batch_id: int) -> None:
+        with self.background_lock:
+            self.background_wait_count = max(0, self.background_wait_count - 1)
+            batch_count = self.background_wait_by_batch.get(batch_id, 0)
+            if batch_count <= 1:
+                self.background_wait_by_batch.pop(batch_id, None)
+            else:
+                self.background_wait_by_batch[batch_id] = batch_count - 1
+
+    def _background_count_for_batch(self, batch_id: Optional[int] = None) -> int:
+        if batch_id is None:
+            batch_id = self.current_batch_id
+        with self.background_lock:
+            return self.background_wait_by_batch.get(batch_id, 0)
+
+    def _on_background_request_done(self, batch_id: int, index: int, fut: Any) -> None:
+        self._leave_background(batch_id)
+        try:
+            ok, elapsed, msg, prompt, retry_used, status = fut.result()
+        except Exception as exc:
+            ok, elapsed, msg, prompt, retry_used, status = (
+                False,
+                0.0,
+                f"后台未捕获异常: {exc}\n{traceback.format_exc()}",
+                "",
+                0,
+                "失败",
+            )
+        self.log_queue.put(("background_result", (batch_id, index, ok, elapsed, msg, prompt, retry_used, status)))
+
+    def _run_one_request(
+        self,
+        settings: RequestSettings,
+        index: int,
+        batch_id: int,
+        stop_event: threading.Event,
+    ) -> Tuple[bool, float, str, str, int, str]:
+        if stop_event.is_set():
             raise StopRequested("stop requested")
         started = time.time()
         retry_used = 0
         last_message = ""
         last_status = "失败"
         for attempt in range(settings.retry_count + 1):
-            if self.stop_event.is_set() and attempt > 0:
+            if stop_event.is_set() and attempt > 0:
                 break
             attempt_started = time.time()
-            client = ImageApiClient(settings.base_url, settings.api_key, timeout=settings.timeout)
+            client = ImageApiClient(settings.base_url, settings.api_key, timeout=settings.hard_timeout_seconds)
             try:
                 if settings.mode == "generate":
                     response = client.generate(self._build_generation_payload(settings))
@@ -1632,14 +1811,18 @@ class GPTImageApp(tk.Tk):
                 elapsed = time.time() - started
                 if saved_files:
                     return True, elapsed, "保存: " + "; ".join(saved_files), settings.prompt, retry_used, "成功"
-                last_message = f"响应中未找到 b64_json 或 url: {compact_json(response)}"
+                data = response.get("data") if isinstance(response, dict) else None
+                if isinstance(data, list) and not data:
+                    last_message = f"\u670d\u52a1\u5546\u54cd\u5e94 data \u4e3a\u7a7a\uff1b\u5e73\u53f0\u4fa7\u5b8c\u6210/\u8ba1\u8d39\u4e0d\u4ee3\u8868\u54cd\u5e94\u91cc\u5305\u542b\u56fe\u7247\uff0c\u672c\u5730\u672a\u6536\u5230 b64_json \u6216 url\uff0c\u65e0\u6cd5\u4fdd\u5b58: {compact_json(response)}"
+                else:
+                    last_message = f"\u54cd\u5e94\u4e2d\u672a\u627e\u5230 b64_json \u6216 url: {compact_json(response)}"
                 last_status = "失败"
             except Exception as exc:
                 last_message = str(exc)
                 last_status = "超时" if self._is_timeout_error(exc) else "失败"
             if attempt < settings.retry_count and self._should_retry_error(last_message):
                 retry_used = attempt + 1
-                self.log_queue.put(("retry", (index, retry_used, settings.retry_count, last_message)))
+                self.log_queue.put(("retry", (batch_id, index, retry_used, settings.retry_count, last_message)))
                 if settings.retry_delay > 0:
                     time.sleep(settings.retry_delay)
                 continue
@@ -1679,7 +1862,12 @@ class GPTImageApp(tk.Tk):
                 payload["resolution"] = resolution
             return payload
 
-        payload = {"model": settings.model, "prompt": settings.prompt, "n": settings.image_count, "size": settings.size}
+        payload = {
+            "model": settings.model,
+            "prompt": settings.prompt,
+            "n": settings.image_count,
+            "size": settings.size,
+        }
         if settings.quality:
             payload["quality"] = settings.quality
         if settings.style:
@@ -1691,7 +1879,12 @@ class GPTImageApp(tk.Tk):
         return payload
 
     def _build_edit_fields(self, settings: RequestSettings) -> Dict[str, Any]:
-        fields: Dict[str, Any] = {"model": settings.model, "prompt": settings.prompt, "n": settings.image_count, "size": settings.size}
+        fields: Dict[str, Any] = {
+            "model": settings.model,
+            "prompt": settings.prompt,
+            "n": settings.image_count,
+            "size": settings.size,
+        }
         if is_grok_platform(settings.platform, settings.base_url):
             fields["response_format"] = "b64_json"
             aspect_ratio = grok_size_to_aspect_ratio(settings.size)
@@ -1741,17 +1934,29 @@ class GPTImageApp(tk.Tk):
             b64 = item.get("b64_json")
             if b64:
                 file_path = out_dir / f"{timestamp}_req{index:04d}_{image_idx}.{extension}"
-                file_path.write_bytes(base64.b64decode(b64))
+                self._atomic_write_bytes(file_path, base64.b64decode(b64))
                 self._resize_saved_image_if_needed(file_path, settings)
                 saved.append(str(file_path))
                 continue
             url = item.get("url")
             if url:
                 file_path = out_dir / f"{timestamp}_req{index:04d}_{image_idx}.{extension}"
-                self._download_image(url, file_path, settings.api_key, settings.timeout)
+                self._download_image(url, file_path, settings.api_key, settings.hard_timeout_seconds)
                 self._resize_saved_image_if_needed(file_path, settings)
                 saved.append(str(file_path))
         return saved
+
+    def _atomic_write_bytes(self, out_path: Path, data: bytes) -> None:
+        tmp_path = out_path.with_name(f"{out_path.name}.{uuid4().hex}.tmp")
+        try:
+            tmp_path.write_bytes(data)
+            os.replace(str(tmp_path), str(out_path))
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
     def _resize_saved_image_if_needed(self, file_path: Path, settings: RequestSettings) -> None:
         if not should_resize_output(settings) or Image is None:
@@ -1795,7 +2000,7 @@ class GPTImageApp(tk.Tk):
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                out_path.write_bytes(resp.read())
+                self._atomic_write_bytes(out_path, resp.read())
         except urllib.error.URLError as exc:
             reason = exc.reason
             if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason).lower():
@@ -1807,6 +2012,20 @@ class GPTImageApp(tk.Tk):
     def _enqueue_log(self, message: str) -> None:
         self.log_queue.put(("log", message))
 
+    def _on_close(self) -> None:
+        if self.background_wait_count > 0 and not self.closed_forcefully:
+            keep_waiting = messagebox.askyesno(
+                "后台请求仍在等待",
+                f"还有 {self.background_wait_count} 个后台请求未返回。\n\n"
+                "选择“是”继续等待；选择“否”强制退出（可能无法保存这些请求返回的图片）。",
+            )
+            if keep_waiting:
+                return
+            self.closed_forcefully = True
+        self.destroy()
+        if self.closed_forcefully:
+            os._exit(0)
+
     def _poll_log_queue(self) -> None:
         try:
             while True:
@@ -1814,7 +2033,9 @@ class GPTImageApp(tk.Tk):
                 if kind == "log":
                     self._append_log(str(payload))
                 elif kind == "status":
-                    idx, status, elapsed, retry_used, max_retry, result = payload
+                    batch_id, idx, status, elapsed, retry_used, max_retry, result = payload
+                    if batch_id != self.current_batch_id:
+                        continue
                     old_status = self.request_statuses.get(idx, {}).get("status")
                     if old_status != "进行中" and status == "进行中":
                         self.in_flight_count += 1
@@ -1823,38 +2044,60 @@ class GPTImageApp(tk.Tk):
                     self._draw_progress()
                     self._update_stop_waiting_status()
                 elif kind == "retry":
-                    idx, retry_used, max_retry, reason = payload
+                    batch_id, idx, retry_used, max_retry, reason = payload
+                    if batch_id != self.current_batch_id:
+                        self._append_log(f"[批次{batch_id} #{idx}] 旧批次第 {retry_used}/{max_retry} 次重试，原因: {reason}")
+                        continue
                     self._update_request_status(idx, status="进行中", retry_used=retry_used, max_retry=max_retry, result=f"重试中: {reason}")
                     self._append_log(f"[#{idx}] 第 {retry_used}/{max_retry} 次重试，原因: {reason}")
-                elif kind == "result":
-                    idx, ok, elapsed, msg, prompt, retry_used, status = payload
-                    self.completed_count += 1
+                elif kind == "background":
+                    batch_id, idx, elapsed, max_retry, result = payload
+                    if batch_id != self.current_batch_id:
+                        self._append_log(f"[批次{batch_id} #{idx}] 旧批次转入后台等待 {elapsed:.1f}s | 返回后自动保存")
+                        self._update_stats()
+                        continue
                     self.in_flight_count = max(0, self.in_flight_count - 1)
-                    self.total_elapsed += elapsed
-                    self.fastest_elapsed = elapsed if self.fastest_elapsed is None else min(self.fastest_elapsed, elapsed)
-                    self.slowest_elapsed = elapsed if self.slowest_elapsed is None else max(self.slowest_elapsed, elapsed)
-                    if ok:
-                        self.success_count += 1
-                        final_status = "成功"
-                        self._append_log(f"[#{idx}] 成功 {elapsed:.1f}s | {msg}")
-                        if self.prompt_mode_var.get() == "lines":
-                            self._record_prompt_history(str(prompt))
-                        else:
-                            self._record_batch_prompt_history_once(str(prompt))
-                    else:
-                        self.fail_count += 1
-                        final_status = status or "失败"
-                        self._append_log(f"[#{idx}] {final_status} {elapsed:.1f}s | {msg}")
-                    max_retry = safe_int(str(self.request_statuses.get(idx, {}).get("retry", "0/0")).split("/")[-1], 0, 0, 5)
-                    self._update_request_status(idx, status=final_status, elapsed=elapsed, retry_used=retry_used, max_retry=max_retry, result=msg)
+                    self._update_request_status(idx, status="\u540e\u53f0\u7b49\u5f85", elapsed=elapsed, retry_used=0, max_retry=max_retry, result=result)
+                    self._append_log(f"[#{idx}] \u8f6c\u5165\u540e\u53f0\u7b49\u5f85 {elapsed:.1f}s | \u8fd4\u56de\u540e\u81ea\u52a8\u4fdd\u5b58")
                     self._set_real_progress()
                     self._update_stats()
                     self._update_stop_waiting_status()
+                elif kind == "result":
+                    batch_id, idx, ok, elapsed, msg, prompt, retry_used, status = payload
+                    if batch_id != self.current_batch_id:
+                        if status != "\u540e\u53f0\u7b49\u5f85":
+                            final_status = "\u6210\u529f" if ok else self._normalize_final_status(status)
+                            self._append_log(f"[批次{batch_id} #{idx}] 旧批次前台完成 {final_status} {elapsed:.1f}s | {msg}")
+                        continue
+                    if status == "\u540e\u53f0\u7b49\u5f85":
+                        self._update_request_status(idx, status="\u540e\u53f0\u7b49\u5f85", elapsed=elapsed, retry_used=retry_used, max_retry=None, result=msg)
+                    else:
+                        self.in_flight_count = max(0, self.in_flight_count - 1)
+                        self._apply_final_result(idx, ok, elapsed, msg, prompt, retry_used, status, "\u524d\u53f0\u5b8c\u6210", batch_id)
+                elif kind == "background_result":
+                    batch_id, idx, ok, elapsed, msg, prompt, retry_used, status = payload
+                    if batch_id != self.current_batch_id:
+                        final_status = "\u6210\u529f" if ok else self._normalize_final_status(status)
+                        self._append_log(f"[批次{batch_id} #{idx}] 旧批次后台完成 {final_status} {elapsed:.1f}s | {msg}")
+                        if not self.running and self.background_wait_count == 0:
+                            self._stop_elapsed_timer()
+                        self._update_stats()
+                        continue
+                    self._apply_final_result(idx, ok, elapsed, msg, prompt, retry_used, status, "\u540e\u53f0\u5b8c\u6210", batch_id)
                 elif kind == "done":
-                    elapsed_total = float(payload)
+                    batch_id, elapsed_total = payload
+                    elapsed_total = float(elapsed_total)
+                    if batch_id != self.current_batch_id:
+                        self._append_log(f"旧批次前台完成 | 批次:{batch_id} 后台等待:{self._background_count_for_batch(batch_id)} 耗时:{elapsed_total:.1f}s")
+                        self._update_stats()
+                        continue
+                    current_background = self._background_count_for_batch(batch_id)
                     self.progress_animating = False
                     self.in_flight_count = 0
-                    self.elapsed_timer_running = False
+                    if self.background_wait_count > 0:
+                        self.elapsed_timer_running = True
+                    else:
+                        self._stop_elapsed_timer()
                     if self.batch_stopping and self.completed_count < self.total_requests:
                         self.progress_text = f"已停止 {self.completed_count}/{self.total_requests}"
                     else:
@@ -1863,10 +2106,14 @@ class GPTImageApp(tk.Tk):
                             self.progress_percent = 100
                             self.progress_text = f"{self.total_requests}/{self.total_requests} 100%"
                     self._draw_progress()
-                    self.elapsed_var.set(f"耗时:{elapsed_total:.1f}s")
-                    if self.success_count > 0 and self.prompt_mode_var.get() != "lines":
-                        self._record_batch_prompt_history_once()
-                    self._append_log(f"完成 | 成功:{self.success_count} 失败:{self.fail_count}/{self.total_requests} 总耗时:{elapsed_total:.1f}s")
+                    if current_background > 0:
+                        self.elapsed_var.set(f"\u524d\u53f0\u5b8c\u6210:{elapsed_total:.1f}s\uff0c\u540e\u53f0\u7b49\u5f85:{current_background}")
+                    else:
+                        self.elapsed_var.set(f"\u8017\u65f6:{elapsed_total:.1f}s")
+                    self._append_log(
+                        f"\u524d\u53f0\u5b8c\u6210 | \u6210\u529f:{self.success_count} \u5931\u8d25:{self.fail_count}/{self.total_requests} "
+                        f"\u672c\u6279\u540e\u53f0\u7b49\u5f85:{current_background} \u540e\u53f0\u603b\u6570:{self.background_wait_count} \u8017\u65f6:{elapsed_total:.1f}s"
+                    )
                     self.running = False
                     self.batch_stopping = False
                     self.batch_prompt_for_history = ""
@@ -1877,6 +2124,61 @@ class GPTImageApp(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._poll_log_queue)
+
+    def _normalize_final_status(self, status: str) -> str:
+        status_text = str(status or "").lower()
+        if "timeout" in status_text or "timed out" in status_text or "\u8d85\u65f6" in str(status):
+            return "\u8d85\u65f6"
+        if status_text in {"success", "ok", "done"} or "\u6210\u529f" in str(status):
+            return "\u6210\u529f"
+        return "\u5931\u8d25"
+
+    def _apply_final_result(
+        self,
+        idx: int,
+        ok: bool,
+        elapsed: float,
+        msg: str,
+        prompt: str,
+        retry_used: int,
+        status: str,
+        source: str,
+        batch_id: Optional[int] = None,
+    ) -> None:
+        old_status = self.request_statuses.get(idx, {}).get("status")
+        if old_status in {"\u6210\u529f", "\u5931\u8d25", "\u8d85\u65f6", "\u5b8c\u6210"}:
+            self._update_request_status(idx, result=msg)
+            return
+        self.completed_count += 1
+        self.total_elapsed += elapsed
+        self.fastest_elapsed = elapsed if self.fastest_elapsed is None else min(self.fastest_elapsed, elapsed)
+        self.slowest_elapsed = elapsed if self.slowest_elapsed is None else max(self.slowest_elapsed, elapsed)
+        if ok:
+            self.success_count += 1
+            final_status = "\u6210\u529f"
+            self._append_log(f"[#{idx}] {source} \u6210\u529f {elapsed:.1f}s | {msg}")
+        else:
+            self.fail_count += 1
+            final_status = self._normalize_final_status(status)
+            self._append_log(f"[#{idx}] {source} {final_status} {elapsed:.1f}s | {msg}")
+        max_retry = safe_int(str(self.request_statuses.get(idx, {}).get("retry", "0/0")).split("/")[-1], 0, 0, 5)
+        self._update_request_status(idx, status=final_status, elapsed=elapsed, retry_used=retry_used, max_retry=max_retry, result=msg)
+        self._set_real_progress()
+        current_background = self._background_count_for_batch(batch_id)
+        if not self.running and current_background == 0:
+            self._stop_elapsed_timer()
+            if self.completed_count >= self.total_requests:
+                self.progress_percent = 100
+                self.progress_text = f"{self.total_requests}/{self.total_requests} 100%"
+                self._draw_progress()
+                self.elapsed_var.set(f"\u5b8c\u6210\uff1a\u6210\u529f {self.success_count}\uff0c\u5931\u8d25 {self.fail_count}")
+                self._append_log(f"\u5168\u90e8\u5b8c\u6210 | \u6210\u529f:{self.success_count} \u5931\u8d25:{self.fail_count}/{self.total_requests}")
+            self.batch_prompt_for_history = ""
+            self.batch_history_recorded = False
+            self.start_button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
+        self._update_stats()
+        self._update_stop_waiting_status()
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1902,10 +2204,15 @@ class GPTImageApp(tk.Tk):
             eta = f"{eta_seconds:.1f}s"
         else:
             eta = "--"
-        self.stats_var.set(
-            f"成功:{self.success_count} 失败:{self.fail_count} 进行中:{self.in_flight_count} "
-            f"成功率:{success_rate:.0f}% 平均:{avg:.1f}s 最快:{fastest} 最慢:{slowest} 预计剩余:{eta}"
-        )
+        self.stats_vars["success"].set(f"\u6210\u529f:{self.success_count}")
+        self.stats_vars["fail"].set(f"\u5931\u8d25:{self.fail_count}")
+        self.stats_vars["running"].set(f"\u8fdb\u884c\u4e2d:{self.in_flight_count}")
+        self.stats_vars["background"].set(f"\u540e\u53f0:{self.background_wait_count}")
+        self.stats_vars["rate"].set(f"\u6210\u529f\u7387:{success_rate:.0f}%")
+        self.stats_vars["avg"].set(f"\u5e73\u5747:{avg:.1f}s")
+        self.stats_vars["fastest"].set(f"\u6700\u5feb:{fastest}")
+        self.stats_vars["slowest"].set(f"\u6700\u6162:{slowest}")
+        self.stats_vars["eta"].set(f"\u9884\u8ba1\u5269\u4f59:{eta}")
 
 
 def main() -> None:
