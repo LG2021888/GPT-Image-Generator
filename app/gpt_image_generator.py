@@ -52,6 +52,7 @@ DEFAULT_GROK_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GROK_MODEL = "grok-imagine-image-lite"
 CONFIG_FILE = "config.ini"
 PROMPT_HISTORY_FILE = "prompt_history.json"
+IMPORTANT_LOG_FILE = "important.log"
 DEFAULT_PROFILE = "默认"
 PROMPT_HISTORY_LIMIT = 30
 DEFAULT_PROMPT_TEXT = "输入你的图片生成提示词；图生图模式下会结合所选图片进行编辑或参考。"
@@ -473,6 +474,7 @@ class GPTImageApp(tk.Tk):
 
         self.config_path = app_base_dir() / CONFIG_FILE
         self.prompt_history_path = app_base_dir() / PROMPT_HISTORY_FILE
+        self.important_log_path = app_base_dir() / IMPORTANT_LOG_FILE
         self.log_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self.profiles: Dict[str, Dict[str, str]] = {}
         self.prompt_history: List[str] = []
@@ -514,6 +516,8 @@ class GPTImageApp(tk.Tk):
         self.batch_timeout = 80
         self.current_batch_id = 0
         self.background_wait_by_batch: Dict[int, int] = {}
+        self.important_log_paths: Dict[int, Path] = {}
+        self.important_log_error_reported = False
 
         self._init_vars()
         self._build_ui()
@@ -1483,6 +1487,12 @@ class GPTImageApp(tk.Tk):
         self.current_batch_id += 1
         batch_id = self.current_batch_id
         batch_stop_event = threading.Event()
+        self.important_log_paths[batch_id] = self.important_log_path
+        self.important_log_error_reported = False
+        self._append_important_log(
+            batch_id,
+            f"START batch={batch_id} total={len(prompts)} output_dir={self._short_important_text(settings.output_dir)}",
+        )
         self.stop_event = batch_stop_event
         self.running = True
         self.batch_stopping = False
@@ -1521,6 +1531,7 @@ class GPTImageApp(tk.Tk):
             f"风格:{style_name} 格式:{settings.output_format} 模型:{settings.model} "
             f"\u91cd\u8bd5:{settings.retry_count} \u95f4\u9694:{settings.retry_delay}s \u540e\u53f0\u9608\u503c:{settings.background_after_seconds}s \u540e\u53f0\u6700\u957f:{settings.hard_timeout_seconds}s"
         )
+        self._enqueue_log(f"\u91cd\u8981\u65e5\u5fd7: {self.important_log_paths[batch_id]}")
         if existing_background > 0:
             self._enqueue_log(f"已有 {existing_background} 个旧后台请求未返回；新批次照常开始，旧后台完成只自动保存并写日志，不计入本批统计。")
         if should_resize_output(settings):
@@ -2067,6 +2078,7 @@ class GPTImageApp(tk.Tk):
                     if batch_id != self.current_batch_id:
                         if status != "\u540e\u53f0\u7b49\u5f85":
                             final_status = "\u6210\u529f" if ok else self._normalize_final_status(status)
+                            self._append_important_result(batch_id, idx, final_status, elapsed, msg, retry_used, "\u524d\u53f0\u5b8c\u6210")
                             self._append_log(f"[批次{batch_id} #{idx}] 旧批次前台完成 {final_status} {elapsed:.1f}s | {msg}")
                         continue
                     if status == "\u540e\u53f0\u7b49\u5f85":
@@ -2078,6 +2090,7 @@ class GPTImageApp(tk.Tk):
                     batch_id, idx, ok, elapsed, msg, prompt, retry_used, status = payload
                     if batch_id != self.current_batch_id:
                         final_status = "\u6210\u529f" if ok else self._normalize_final_status(status)
+                        self._append_important_result(batch_id, idx, final_status, elapsed, msg, retry_used, "\u540e\u53f0\u5b8c\u6210")
                         self._append_log(f"[批次{batch_id} #{idx}] 旧批次后台完成 {final_status} {elapsed:.1f}s | {msg}")
                         if not self.running and self.background_wait_count == 0:
                             self._stop_elapsed_timer()
@@ -2114,6 +2127,7 @@ class GPTImageApp(tk.Tk):
                         f"\u524d\u53f0\u5b8c\u6210 | \u6210\u529f:{self.success_count} \u5931\u8d25:{self.fail_count}/{self.total_requests} "
                         f"\u672c\u6279\u540e\u53f0\u7b49\u5f85:{current_background} \u540e\u53f0\u603b\u6570:{self.background_wait_count} \u8017\u65f6:{elapsed_total:.1f}s"
                     )
+                    self._append_important_summary(batch_id, elapsed_total, current_background, "\u524d\u53f0\u5b8c\u6210")
                     self.running = False
                     self.batch_stopping = False
                     self.batch_prompt_for_history = ""
@@ -2161,6 +2175,7 @@ class GPTImageApp(tk.Tk):
             self.fail_count += 1
             final_status = self._normalize_final_status(status)
             self._append_log(f"[#{idx}] {source} {final_status} {elapsed:.1f}s | {msg}")
+        self._append_important_result(batch_id, idx, final_status, elapsed, msg, retry_used, source)
         max_retry = safe_int(str(self.request_statuses.get(idx, {}).get("retry", "0/0")).split("/")[-1], 0, 0, 5)
         self._update_request_status(idx, status=final_status, elapsed=elapsed, retry_used=retry_used, max_retry=max_retry, result=msg)
         self._set_real_progress()
@@ -2173,12 +2188,70 @@ class GPTImageApp(tk.Tk):
                 self._draw_progress()
                 self.elapsed_var.set(f"\u5b8c\u6210\uff1a\u6210\u529f {self.success_count}\uff0c\u5931\u8d25 {self.fail_count}")
                 self._append_log(f"\u5168\u90e8\u5b8c\u6210 | \u6210\u529f:{self.success_count} \u5931\u8d25:{self.fail_count}/{self.total_requests}")
+                self._append_important_summary(batch_id, self.total_elapsed, 0, "\u5168\u90e8\u5b8c\u6210")
             self.batch_prompt_for_history = ""
             self.batch_history_recorded = False
             self.start_button.configure(state="normal")
             self.stop_button.configure(state="disabled")
         self._update_stats()
         self._update_stop_waiting_status()
+
+    def _short_important_text(self, value: Any, limit: int = 500) -> str:
+        text = " ".join(str(value or "").split())
+        return text if len(text) <= limit else text[: limit - 3] + "..."
+
+    def _append_important_log(self, batch_id: Optional[int], message: str) -> None:
+        if batch_id is None:
+            batch_id = self.current_batch_id
+        log_path = self.important_log_paths.get(batch_id)
+        if log_path is None:
+            try:
+                log_path = self.important_log_path
+            except Exception:
+                return
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"[{timestamp}] {message}\n")
+        except Exception as exc:
+            if not self.important_log_error_reported:
+                self.important_log_error_reported = True
+                self._append_log(f"\u91cd\u8981\u65e5\u5fd7\u4fdd\u5b58\u5931\u8d25: {exc}")
+
+    def _append_important_result(
+        self,
+        batch_id: Optional[int],
+        idx: int,
+        final_status: str,
+        elapsed: float,
+        msg: str,
+        retry_used: int,
+        source: str,
+    ) -> None:
+        status = self._short_important_text(final_status, 30)
+        source_text = self._short_important_text(source, 30)
+        message = self._short_important_text(msg)
+        self._append_important_log(
+            batch_id,
+            f"RESULT batch={batch_id} request={idx} source={source_text} status={status} "
+            f"elapsed={elapsed:.1f}s retry={retry_used} message={message}",
+        )
+
+    def _append_important_summary(
+        self,
+        batch_id: Optional[int],
+        elapsed_total: float,
+        background_wait: int,
+        source: str,
+    ) -> None:
+        source_text = self._short_important_text(source, 30)
+        self._append_important_log(
+            batch_id,
+            f"SUMMARY batch={batch_id} source={source_text} success={self.success_count} "
+            f"fail={self.fail_count} total={self.total_requests} background_wait={background_wait} "
+            f"elapsed={elapsed_total:.1f}s",
+        )
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")

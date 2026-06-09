@@ -23,6 +23,8 @@ if exist "%OUT_DIR%\config.ini" copy /Y "%OUT_DIR%\config.ini" "%KEEP%\config.in
 if not exist "%KEEP%\config.ini" if exist "%OLD_OUT_DIR%\config.ini" copy /Y "%OLD_OUT_DIR%\config.ini" "%KEEP%\config.ini" >nul
 if exist "%OUT_DIR%\prompt_history.json" copy /Y "%OUT_DIR%\prompt_history.json" "%KEEP%\prompt_history.json" >nul
 if not exist "%KEEP%\prompt_history.json" if exist "%OLD_OUT_DIR%\prompt_history.json" copy /Y "%OLD_OUT_DIR%\prompt_history.json" "%KEEP%\prompt_history.json" >nul
+if exist "%OUT_DIR%\important.log" copy /Y "%OUT_DIR%\important.log" "%KEEP%\important.log" >nul
+if not exist "%KEEP%\important.log" if exist "%OLD_OUT_DIR%\important.log" copy /Y "%OLD_OUT_DIR%\important.log" "%KEEP%\important.log" >nul
 if exist "%OUT_DIR%\output" xcopy /E /I /Y "%OUT_DIR%\output" "%KEEP%\output" >nul
 if not exist "%KEEP%\output" if exist "%OLD_OUT_DIR%\output" xcopy /E /I /Y "%OLD_OUT_DIR%\output" "%KEEP%\output" >nul
 
@@ -51,7 +53,7 @@ if errorlevel 1 exit /b %errorlevel%
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%" >nul 2>nul
 
 rem Replace only packaged program artifacts. Never delete runtime user data:
-rem   config.ini, prompt_history.json, output\
+rem   config.ini, prompt_history.json, important.log, output\
 if exist "%OUT_DIR%\GPTImageGenerator.exe" del /f /q "%OUT_DIR%\GPTImageGenerator.exe"
 if exist "%OUT_DIR%\_internal" rmdir /s /q "%OUT_DIR%\_internal"
 if exist "%OUT_DIR%\_tcl_data" rmdir /s /q "%OUT_DIR%\_tcl_data"
@@ -72,6 +74,7 @@ if errorlevel 1 exit /b %errorlevel%
 
 if exist "%KEEP%\config.ini" copy /Y "%KEEP%\config.ini" "%OUT_DIR%\config.ini" >nul
 if exist "%KEEP%\prompt_history.json" copy /Y "%KEEP%\prompt_history.json" "%OUT_DIR%\prompt_history.json" >nul
+if exist "%KEEP%\important.log" copy /Y "%KEEP%\important.log" "%OUT_DIR%\important.log" >nul
 if exist "%KEEP%\output" xcopy /E /I /Y "%KEEP%\output" "%OUT_DIR%\output" >nul
 if exist "%KEEP%" rmdir /s /q "%KEEP%"
 if exist ".build_tmp" rmdir /s /q ".build_tmp"

@@ -5,3 +5,4 @@ config.ini
 .pydeps
 # 历史文件
 prompt_history.json
+**/important.log
