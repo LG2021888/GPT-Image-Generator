@@ -782,6 +782,7 @@ class GPTImageApp(tk.Tk):
             self.status_tree.column(col, width=widths[col], minwidth=40, anchor="w", stretch=(col == "result"))
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.status_tree.yview)
         self.status_tree.configure(yscrollcommand=scroll.set)
+        self.status_tree.bind("<Double-1>", self._on_status_double_click)
         self.status_tree.grid(row=0, column=0, sticky="ew")
         scroll.grid(row=0, column=1, sticky="ns")
 
@@ -1395,14 +1396,17 @@ class GPTImageApp(tk.Tk):
         path = Path(self.output_dir_var.get().strip() or default_output_dir()).resolve()
         try:
             path.mkdir(parents=True, exist_ok=True)
-            if sys.platform.startswith("win"):
-                os.startfile(str(path))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(path)])
-            else:
-                subprocess.Popen(["xdg-open", str(path)])
+            self._open_path(path)
         except Exception as exc:
             messagebox.showerror("打开输出目录失败", str(exc))
+
+    def _open_path(self, path: Path) -> None:
+        if sys.platform.startswith("win"):
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
 
     def _current_settings(self) -> RequestSettings:
         custom_size = self.custom_size_var.get().strip()
@@ -1616,6 +1620,8 @@ class GPTImageApp(tk.Tk):
                 "elapsed": "",
                 "retry": f"0/{max_retry}",
                 "result": "",
+                "raw_result": "",
+                "saved_files": [],
             }
             if self.status_tree is not None:
                 self.status_tree.insert("", "end", iid=str(idx), values=(idx, "等待中", "", f"0/{max_retry}", ""))
@@ -1628,8 +1634,12 @@ class GPTImageApp(tk.Tk):
         retry_used: Optional[int] = None,
         max_retry: Optional[int] = None,
         result: Optional[str] = None,
+        saved_files: Optional[List[str]] = None,
     ) -> None:
-        info = self.request_statuses.setdefault(idx, {"status": "等待中", "elapsed": "", "retry": "", "result": ""})
+        info = self.request_statuses.setdefault(
+            idx,
+            {"status": "等待中", "elapsed": "", "retry": "", "result": "", "raw_result": "", "saved_files": []},
+        )
         if status is not None:
             info["status"] = status
         if elapsed is not None:
@@ -1639,7 +1649,10 @@ class GPTImageApp(tk.Tk):
                 max_retry = safe_int(str(info.get("retry", "0/0")).split("/")[-1], 0, 0, 5)
             info["retry"] = f"{retry_used}/{max_retry}"
         if result is not None:
+            info["raw_result"] = str(result)
             info["result"] = self._short_result(result)
+        if saved_files is not None:
+            info["saved_files"] = list(saved_files)
         if self.status_tree is not None:
             values = (idx, info.get("status", ""), info.get("elapsed", ""), info.get("retry", ""), info.get("result", ""))
             iid = str(idx)
@@ -1652,6 +1665,51 @@ class GPTImageApp(tk.Tk):
     def _short_result(self, result: str, limit: int = 120) -> str:
         result = " ".join(str(result).split())
         return result if len(result) <= limit else result[: limit - 3] + "..."
+
+    def _extract_saved_files(self, result: str) -> List[str]:
+        text = str(result or "")
+        if not text.startswith("\u4fdd\u5b58:"):
+            return []
+        return [item.strip() for item in text.split(":", 1)[1].split(";") if item.strip()]
+
+    def _on_status_double_click(self, event: tk.Event) -> None:
+        if self.status_tree is None:
+            return
+        iid = self.status_tree.identify_row(event.y)
+        if not iid:
+            return
+        idx = safe_int(str(iid), 0, 0, 1000000)
+        if idx <= 0:
+            return
+        info = self.request_statuses.get(idx)
+        if not info:
+            return
+
+        status = str(info.get("status", ""))
+        if status == "\u6210\u529f":
+            saved_files = list(info.get("saved_files") or self._extract_saved_files(str(info.get("raw_result", ""))))
+            if not saved_files:
+                return
+            image_path = Path(str(saved_files[0])).expanduser()
+            if not image_path.exists():
+                messagebox.showerror("\u6253\u5f00\u56fe\u7247\u5931\u8d25", f"\u56fe\u7247\u4e0d\u5b58\u5728: {image_path}")
+                return
+            try:
+                self._open_path(image_path)
+            except Exception as exc:
+                messagebox.showerror("\u6253\u5f00\u56fe\u7247\u5931\u8d25", str(exc))
+            return
+
+        if status in {"\u5931\u8d25", "\u8d85\u65f6"}:
+            text = str(info.get("raw_result") or "")
+            if not text:
+                return
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(text)
+                self.update_idletasks()
+            except Exception as exc:
+                messagebox.showerror("\u590d\u5236\u65e5\u5fd7\u5931\u8d25", str(exc))
 
     def _update_stop_waiting_status(self) -> None:
         if self.batch_stopping and self.running:
@@ -2163,6 +2221,7 @@ class GPTImageApp(tk.Tk):
         if old_status in {"\u6210\u529f", "\u5931\u8d25", "\u8d85\u65f6", "\u5b8c\u6210"}:
             self._update_request_status(idx, result=msg)
             return
+        saved_files = self._extract_saved_files(msg) if ok else []
         self.completed_count += 1
         self.total_elapsed += elapsed
         self.fastest_elapsed = elapsed if self.fastest_elapsed is None else min(self.fastest_elapsed, elapsed)
@@ -2177,7 +2236,15 @@ class GPTImageApp(tk.Tk):
             self._append_log(f"[#{idx}] {source} {final_status} {elapsed:.1f}s | {msg}")
         self._append_important_result(batch_id, idx, final_status, elapsed, msg, retry_used, source)
         max_retry = safe_int(str(self.request_statuses.get(idx, {}).get("retry", "0/0")).split("/")[-1], 0, 0, 5)
-        self._update_request_status(idx, status=final_status, elapsed=elapsed, retry_used=retry_used, max_retry=max_retry, result=msg)
+        self._update_request_status(
+            idx,
+            status=final_status,
+            elapsed=elapsed,
+            retry_used=retry_used,
+            max_retry=max_retry,
+            result=msg,
+            saved_files=saved_files,
+        )
         self._set_real_progress()
         current_background = self._background_count_for_batch(batch_id)
         if not self.running and current_background == 0:
